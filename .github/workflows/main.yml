@@ -1,0 +1,44 @@
+name: Public data smoke test
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - '.github/workflows/main.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  source-check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Check runner and public forecast sources
+        shell: bash
+        run: |
+          nproc
+          free -m
+          python3 - <<'PY'
+          import datetime as dt
+          import json
+          import time
+          import urllib.request
+          for model in ('ecmwf_ifs025', 'ncep_gfs025'):
+              base = f'https://openmeteo.s3.amazonaws.com/data_spatial/{model}/'
+              with urllib.request.urlopen(base + 'latest.json', timeout=30) as response:
+                  meta = json.load(response)
+              assert meta.get('completed'), 'Incomplete run'
+              assert 'geopotential_height_500hPa' in meta['variables'], 'Missing height field'
+              run = dt.datetime.fromisoformat(meta['reference_time'].replace('Z', '+00:00'))
+              valid = dt.datetime.fromisoformat(meta['valid_times'][0].replace('Z', '+00:00'))
+              url = base + run.strftime('%Y/%m/%d/%H%MZ/') + valid.strftime('%Y-%m-%dT%H%M.om')
+              request = urllib.request.Request(url, headers={'Range': 'bytes=0-15'})
+              start = time.perf_counter()
+              with urllib.request.urlopen(request, timeout=30) as response:
+                  ttfb = (time.perf_counter() - start) * 1000
+                  assert response.status == 206, 'Range not supported'
+                  payload = response.read(17)
+                  assert len(payload) == 16, 'Unexpected range length'
+                  print(json.dumps({'model': model, 'url': url, 'status': response.status, 'bytes': len(payload), 'ttfb_ms': round(ttfb, 2), 'content_range': response.headers.get('Content-Range')}))
+          PY
