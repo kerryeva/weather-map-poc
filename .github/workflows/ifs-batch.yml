@@ -1,0 +1,73 @@
+name: IFS batch resource test
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: 'discard: only measure; r2: upload to private test bucket'
+        type: choice
+        options: [discard, r2]
+        default: discard
+      leads:
+        description: 'all or comma-separated 3-hour leads, for example 0,3'
+        default: all
+        type: string
+      profile:
+        type: choice
+        options: [full, 500hpa]
+        default: full
+        description: 'full: 54 IFS product combinations'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ifs-test-single-writer
+  cancel-in-progress: false
+
+jobs:
+  measure:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 330
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: '26'
+          package-manager-cache: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: '3.12'
+      - name: Install pinned processing dependencies
+        run: |
+          npm ci --ignore-scripts --no-audit --no-fund
+          python -m pip install --no-cache-dir -r requirements.txt
+      - name: Run quota and geometry regression tests
+        run: |
+          npm test
+          python -m unittest discover -s tests -p 'test_*.py' -v
+      - name: Inspect runner disk
+        run: |
+          df -h "$RUNNER_TEMP"
+          free -m
+          nproc
+      - name: Process one frozen IFS run
+        env:
+          TEST_MODE: ${{ inputs.mode || 'discard' }}
+          TEST_LEADS: ${{ inputs.leads || 'all' }}
+          TEST_PROFILE: ${{ inputs.profile || 'full' }}
+          AWS_ACCESS_KEY_ID: ${{ secrets.IFS_R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.IFS_R2_SECRET_ACCESS_KEY }}
+          R2_ACCOUNT_ID: ${{ vars.IFS_R2_ACCOUNT_ID }}
+          R2_BUCKET: ${{ vars.IFS_R2_BUCKET }}
+        run: |
+          python scripts/batch.py \
+            --work "$RUNNER_TEMP/ifs-work" \
+            --report "$RUNNER_TEMP/ifs-evidence/run.json" \
+            --mode "$TEST_MODE" --leads "$TEST_LEADS" --profile "$TEST_PROFILE"
+      - name: Keep small statistics in job log
+        if: always()
+        run: python scripts/summary.py "$RUNNER_TEMP/ifs-evidence/run.json" --archive-log
+
+# 默认没有 schedule。完整 Linux 单批通过、R2 授权和费用检查完成后再启用七天试运行。
+# 不使用大型运行器、upload-artifact 或 Actions cache 保存气象数据。

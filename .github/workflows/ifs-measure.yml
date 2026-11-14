@@ -1,0 +1,73 @@
+name: IFS 41-step Linux resource test
+
+on:
+  push:
+    branches: [ifs-batch-test]
+    paths: ['.github/workflows/ifs-measure.yml']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ifs-linux-measurement
+  cancel-in-progress: false
+
+jobs:
+  freeze:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      metadata: ${{ steps.freeze.outputs.metadata }}
+      matrix: ${{ steps.freeze.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - id: freeze
+        run: python3 scripts/freeze_run.py
+
+  measure:
+    name: IFS F${{ matrix.lead }}
+    needs: freeze
+    strategy:
+      fail-fast: false
+      max-parallel: 4
+      matrix: ${{ fromJSON(needs.freeze.outputs.matrix) }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: '26'
+          package-manager-cache: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: '3.12'
+      - name: Install pinned dependencies
+        run: |
+          npm ci --ignore-scripts --no-audit --no-fund
+          python -m pip install --no-cache-dir -r requirements.txt
+      - name: Check fuses and geometry
+        run: |
+          npm test
+          python -m unittest discover -s tests -p 'test_*.py'
+      - name: Measure one lead from the frozen run
+        env:
+          FROZEN_METADATA: ${{ needs.freeze.outputs.metadata }}
+          FORECAST_LEAD: ${{ matrix.lead }}
+        run: |
+          python -c 'import os,pathlib; pathlib.Path(os.environ["RUNNER_TEMP"],"frozen.json").write_text(os.environ["FROZEN_METADATA"])'
+          df -h "$RUNNER_TEMP"
+          free -m
+          nproc
+          python scripts/batch.py \
+            --work "$RUNNER_TEMP/ifs-work" \
+            --report "$RUNNER_TEMP/ifs-evidence/run.json" \
+            --metadata "$RUNNER_TEMP/frozen.json" \
+            --mode discard --profile full --leads "$FORECAST_LEAD"
+      - name: Keep only small public statistics in job log
+        if: always()
+        run: python scripts/summary.py "$RUNNER_TEMP/ifs-evidence/run.json" --archive-log
+
+# 全部任务使用同一冻结起报，每任务只处理一个时次；均不读取R2凭据或上传成品。
+# 不启用schedule、大型运行器、upload-artifact或Actions持久缓存。
