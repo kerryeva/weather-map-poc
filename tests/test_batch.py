@@ -80,7 +80,8 @@ class Fuses(unittest.TestCase):
         def fail(keys):raise ConnectionError('simulated cleanup failure')
         self.store.delete=fail;before=self.store.requests['put']
         with self.assertRaises(ConnectionError):publisher.prepare(run_key(3))
-        self.assertEqual(self.store.requests['put'],before)
+        self.assertNotIn(object_key(3),self.store.list())
+        self.assertEqual(self.store.read_json(PREFIX+'latest.json'),latest)
     def test_missing_latest_does_not_delete_completed_batch(self):
         self.owner();self.seed(object_key(1),encoded({'status':'complete'}))
         publisher=Publisher(self.store,reserve=0)
@@ -91,6 +92,21 @@ class Fuses(unittest.TestCase):
         try:
             with self.assertRaises(SafetyStop):acquire_lease(self.store)
         finally:release_lease(self.store,one)
+    def test_ready_time_is_published_before_entire_run(self):
+        import hashlib
+        publisher=Publisher(self.store,reserve=0);publisher.prepare(run_key(1))
+        key=object_key(1,'F003/product.pmtiles');data=b'verified-product';md5=hashlib.md5(data).hexdigest()
+        publisher.put(key,data,immutable=True)
+        manifest={'lead':3,'valid':'2026-11-13T21:00:00Z','product_bytes':len(data),
+            'products':[{'key':'height','status':'verified','object_key':key,'bytes':len(data),'md5':md5}]}
+        with self.assertRaises(SafetyStop):publisher.publish_time(manifest)
+        publisher.put_json(object_key(1,'F003/manifest.json'),manifest)
+        publisher.publish_time(manifest)
+        available=self.store.read_json(PREFIX+'available.json')
+        self.assertFalse(available['complete']);self.assertEqual([r['lead'] for r in available['times']],[3])
+        self.assertIsNone(self.store.read_json(PREFIX+'latest.json'))
+        with self.assertRaises(SafetyStop):publisher.complete_available([3,6])
+        publisher.complete_available([3]);self.assertTrue(self.store.read_json(PREFIX+'available.json')['complete'])
 
 class Plan(unittest.TestCase):
     def test_empty_or_incomplete_resume_manifest_cannot_skip_processing(self):

@@ -3,6 +3,20 @@ import assert from 'node:assert/strict';
 import {catalog,fieldsFor,colorFor,GRID} from '../src/catalog.mjs';
 import {dynamics,dewpointSpread,omega,derive} from '../src/fields.mjs';
 import {fillBands} from '../src/fill.mjs';
+import {lineContours} from '../src/lines.mjs';
+
+test('临界值插值舍入成同一点时删除零长线，保留非零短线',()=>{
+  const grid={nx:9,ny:9,lonMin:-87,latMin:-14,dx:.25,dy:.25};
+  for(const delta of [1e-14,1e-12]){
+    const values=new Float64Array(81).fill(-56);values[40]=-52+delta;values[60]=-48;
+    const result=lineContours(values,grid,4);
+    for(const feature of result.features){
+      const points=feature.geometry.coordinates;assert.ok(points.length>=2);
+      for(let i=1;i<points.length;i++)assert.notDeepEqual(points[i],points[i-1]);
+    }
+    if(delta===1e-12)assert.ok(result.features.some(f=>f.properties.value===-52),'不能按长度阈值删掉真实短线');
+  }
+});
 
 test('IFS 54组合和43变量；去掉额外相对涡度为48种',()=>{
   const products=catalog();assert.equal(products.length,54);
@@ -40,4 +54,12 @@ test('风场压缩网格北至南，分量顺序u后v',()=>{
   const u=Float32Array.from({length:GRID.nx*GRID.ny},(_,i)=>Math.floor(i/GRID.nx)),v=new Float32Array(u.length).fill(5);
   const packed=derive({id:'wind'},[u,v]);assert.equal(packed.length,720*361*2);
   assert.equal(packed[0],720);assert.equal(packed[720*360],0);assert.equal(packed[720*361],5);
+});
+test('全部7个风场共用缺测拦截，不能把缺测伪造成零风',()=>{
+  const u=new Float32Array(GRID.nx*GRID.ny).fill(3),v=new Float32Array(u.length).fill(4);
+  const products=catalog().filter(p=>p.kind==='wind');assert.equal(products.length,7);
+  for(const product of products){
+    const packed=derive(product,[u,v]);assert.equal(packed[0],3);assert.equal(packed[720*361],4);
+    u[0]=NaN;assert.throws(()=>derive(product,[u,v]),/风场存在缺测/);u[0]=3;
+  }
 });

@@ -59,6 +59,7 @@ class LocalStore:
     def read_json(self,key):
         self.requests['get']+=1;path=self._path(key)
         if not path.exists():return None
+        if path.stat().st_size>2_000_000:raise SafetyStop('控制清单过大，禁止继续处理')
         return json.loads(path.read_text())
 
     def put(self,key,payload,immutable=False):
@@ -75,23 +76,26 @@ class LocalStore:
             self.requests['delete']+=1;self._path(key).unlink(missing_ok=True)
 
 class R2Store:
-    def __init__(self,bucket):
+    def __init__(self,bucket,max_list_pages=100):
         import boto3
         from botocore.config import Config
-        self.bucket=bucket;self.requests={'list':0,'get':0,'put':0,'delete':0}
+        self.bucket=bucket;self.max_list_pages=max_list_pages;self.requests={'list':0,'get':0,'put':0,'delete':0}
         account=os.environ.get('R2_ACCOUNT_ID','')
         if not re.fullmatch('[a-f0-9]{32}',account) or not bucket:
             raise SafetyStop('缺少有效的 R2 账户或桶配置')
         if not os.environ.get('AWS_ACCESS_KEY_ID') or not os.environ.get('AWS_SECRET_ACCESS_KEY'):
             raise SafetyStop('缺少受限的 R2 读写凭据；不使用匿名或公开访问替代')
         self.client=boto3.client('s3',endpoint_url=f'https://{account}.r2.cloudflarestorage.com',
+            aws_access_key_id=os.environ['AWS_ACCESS_KEY_ID'],aws_secret_access_key=os.environ['AWS_SECRET_ACCESS_KEY'],
             region_name='auto',config=Config(retries={'total_max_attempts':2,'mode':'standard'},
             connect_timeout=15,read_timeout=90,request_checksum_calculation='when_required',
             response_checksum_validation='when_required'))
 
     def list(self):
-        result={};token=None
+        result={};token=None;seen=set();pages=0
         while True:
+            pages+=1
+            if pages>self.max_list_pages:raise SafetyStop('对象清单分页过多，停止以避免无限读取')
             args={'Bucket':self.bucket}
             if token:args['ContinuationToken']=token
             self.requests['list']+=1;page=self.client.list_objects_v2(**args)
@@ -100,6 +104,8 @@ class R2Store:
             if not page.get('IsTruncated'):return result
             token=page.get('NextContinuationToken')
             if not token:raise SafetyStop('对象列表未完整返回，禁止继续上传')
+            if token in seen:raise SafetyStop('对象列表分页令牌重复，停止循环读取')
+            seen.add(token)
 
     def read_json(self,key):
         from botocore.exceptions import ClientError
@@ -109,7 +115,11 @@ class R2Store:
         except ClientError as error:
             if error.response['Error']['Code'] in ('NoSuchKey','404'):return None
             raise
-        with response['Body'] as body:return json.loads(body.read())
+        with response['Body'] as body:
+            if response.get('ContentLength',2_000_001)>2_000_000:raise SafetyStop('控制清单过大，禁止继续处理')
+            data=body.read(2_000_001)
+            if len(data)>2_000_000:raise SafetyStop('控制清单长度异常')
+            return json.loads(data)
 
     def put(self,key,payload,immutable=False):
         from botocore.exceptions import ClientError
@@ -143,6 +153,7 @@ class Publisher:
         self.store=store;self.ceiling=ceiling;self.reserve=reserve
         self.refresh();self.peak_bytes=self.current_bytes
         self.latest=store.read_json(PREFIX+'latest.json');self.remaining=0;self.target=None
+        self.available=store.read_json(PREFIX+'available.json')
         self._check()
         owner=store.read_json(PREFIX+'owner.json')
         if owner is None:
@@ -178,6 +189,12 @@ class Publisher:
             keep.add(latest_id)
         elif any(PREFIX+f'runs/{r}/manifest.json' in self.objects for r in self.batches):
             raise SafetyStop('存在完整批次但最新索引缺失，须先恢复索引')
+        self.remaining=METADATA_RESERVATION
+        if not self.available or self.available.get('run_id')!=run_id:
+            # 在清理前撤下旧的未完成入口，仍提供最近完整批次回退。
+            self.available={'run_id':run_id,'complete':False,'times':[],
+                'fallback_run_id':self.latest['run_id'] if self.latest else None}
+            self.put_json(PREFIX+'available.json',self.available)
         # 必须先检查是否已超两批；不通过自动删除掩盖保险丝触发。
         old=run_ids(self.objects)-keep
         if old:
@@ -201,7 +218,8 @@ class Publisher:
         previous=self.objects.get(key,{}).get('bytes',0);extra=max(0,size-previous)
         if extra>self.remaining:raise SafetyStop('上传量超过本时次预留空间')
         # 不再查询远端。此检查只有整数运算和少量批次名集合操作。
-        self._check(additional=extra,new_run=self.target)
+        new_run=self.target if self.target and key.startswith(PREFIX+f'runs/{self.target}/') else None
+        self._check(additional=extra,new_run=new_run)
         etag=self.store.put(key,payload,immutable=immutable);self.remaining-=extra
         self.objects[key]={'bytes':size,'etag':etag};self.current_bytes+=size-previous
         if key.startswith(PREFIX+'runs/'):self.batches.add(key[len(PREFIX+'runs/'):].split('/')[0])
@@ -214,8 +232,31 @@ class Publisher:
     def matches(self,key,size,md5):
         return self.objects.get(key)=={'bytes':size,'etag':md5}
 
+    def publish_time(self,manifest):
+        """只有该时次全部成品在存储中核验一致后，才让它出现在可用目录。"""
+        rows=[r for r in manifest['products'] if r['status']=='verified']
+        if not rows or not all(self.matches(r['object_key'],r['bytes'],r['md5']) for r in rows):
+            raise SafetyStop('时次成品未全部上传并校验，禁止提前开放')
+        key=PREFIX+f"runs/{self.target}/F{manifest['lead']:03}/manifest.json"
+        if key not in self.objects:raise SafetyStop('时次清单尚未提交，禁止提前开放')
+        item={'lead':manifest['lead'],'valid':manifest['valid'],'manifest_key':key,
+            'product_bytes':manifest['product_bytes'],'verified_products':len(rows)}
+        times={row['lead']:row for row in self.available['times']};times[item['lead']]=item
+        self.available={**self.available,'processing_sha256':manifest.get('processing_sha256'),
+            'profile':manifest.get('profile'),'times':sorted(times.values(),key=lambda x:x['lead'])}
+        self.put_json(PREFIX+'available.json',self.available)
+
+    def complete_available(self,expected_leads):
+        if {r['lead'] for r in self.available['times']}!=set(expected_leads):
+            raise SafetyStop('可用时次未覆盖请求范围，不能标记整批完成')
+        self.available={**self.available,'complete':True}
+        self.put_json(PREFIX+'available.json',self.available)
+
     def reserve_month(self,month,writes):
         key=PREFIX+f'budgets/{month}.json';ledger=self.store.read_json(key) or {'reserved_class_a':0}
+        if type(ledger.get('reserved_class_a')) is not int or not 0<=ledger['reserved_class_a']<=800_000:
+            raise SafetyStop('上传操作预算记录异常')
+        if type(writes) is not int or writes<0:raise SafetyStop('操作预留无效')
         if ledger['reserved_class_a']+writes>800_000:
             raise SafetyStop('上传操作保险丝：本处理程序预留 A 类操作将超过每月80万次')
         ledger['reserved_class_a']+=writes

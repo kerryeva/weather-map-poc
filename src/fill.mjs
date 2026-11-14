@@ -7,9 +7,11 @@ import {smoothField} from './smoothing.mjs';
 function nextAbove(value){const b=new DataView(new ArrayBuffer(8));b.setFloat64(0,value);b.setBigUint64(0,b.getBigUint64(0)+1n);return b.getFloat64(0);}
 
 // 先生成共享阈值区域再求差。此处不各自平滑/简化相邻色带的边界。
-export function fillBands(id,values,grid,{sigma=0}={}){
+export function fillBands(id,values,grid,{sigma=0,onSmoothing}={}){
  const definition=DEFINITIONS[id];if(!definition?.breaks)throw Error('产品不是分级填色');
- const field=smoothField(values,grid,sigma);let min=Infinity,max=-Infinity;
+ const smoothStart=performance.now(),field=smoothField(values,grid,sigma);
+ onSmoothing?.((performance.now()-smoothStart)/1000);
+ let min=Infinity,max=-Infinity;
  for(const v of field)if(Number.isFinite(v)){min=Math.min(min,v);max=Math.max(max,v);}
  if(min===Infinity)return {type:'FeatureCollection',features:[]};
  const epsilon=1e-5,levels=[min-epsilon,...definition.breaks];

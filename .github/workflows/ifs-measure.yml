@@ -23,7 +23,7 @@ jobs:
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
       - id: freeze
-        run: python3 scripts/freeze_run.py
+        run: python3 scripts/freeze_run.py --metadata benchmarks/ifs-20261113T18Z.json
 
   measure:
     name: IFS F${{ matrix.lead }}
@@ -64,7 +64,22 @@ jobs:
             --work "$RUNNER_TEMP/ifs-work" \
             --report "$RUNNER_TEMP/ifs-evidence/run.json" \
             --metadata "$RUNNER_TEMP/frozen.json" \
-            --mode discard --profile full --leads "$FORECAST_LEAD"
+            --mode discard --profile full --leads "$FORECAST_LEAD" --product-workers 4
+      - name: Preserve bounded diagnostics for failed public-data processing
+        # 本资源任务没有R2凭据；不要把原始处理日志步骤复制到私有发布工作流。
+        if: failure()
+        env:
+          EVIDENCE_DIR: ${{ runner.temp }}/ifs-evidence
+        run: |
+          python - <<'PY'
+          import os,pathlib
+          for path in sorted(pathlib.Path(os.environ['EVIDENCE_DIR']).glob('F*.log')):
+              with path.open('rb') as stream:
+                  stream.seek(0,2)
+                  stream.seek(max(0,stream.tell()-12000))
+                  print('\nPublic processing log:',path.name)
+                  print(stream.read(12000).decode('utf8',errors='replace'))
+          PY
       - name: Keep only small public statistics in job log
         if: always()
         run: python scripts/summary.py "$RUNNER_TEMP/ifs-evidence/run.json" --archive-log

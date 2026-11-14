@@ -28,7 +28,9 @@ function runPython(script,args){
   if(result.status!==0)throw Error(`${script} 失败：${result.stderr}`);
   return JSON.parse(result.stdout);
 }
-for(const product of catalog(profile)){
+const selected=config.productKey?catalog(profile).filter(p=>p.key===config.productKey):catalog(profile);
+if(!selected.length)throw Error('产品选择无效');
+for(const product of selected){
   // 起报时刻不存在“前一累计时段”，单独记录，不能伪造零降水。
   if(lead===0&&product.id==='rain'){
     rows.push({key:product.key,status:'not_applicable',reason:'initial_time_has_no_preceding_accumulation'});continue;
@@ -36,12 +38,15 @@ for(const product of catalog(profile)){
   const start=performance.now(),cpu=process.cpuUsage(),folder=`${scratchDir}/${product.key}`;
   await mkdir(folder,{recursive:true});
   const data=derive(product,await Promise.all(product.inputs.map(load)),derived);
+  const timings={field_read_and_derivation_seconds:(performance.now()-start)/1000};
   let metrics,file;
   if(product.kind==='wind'){
+    const packStart=performance.now();
     file=`${outputDir}/${product.key}.wind.f32.gz`;
     const raw=Buffer.from(data.buffer,data.byteOffset,data.byteLength),packed=gzipSync(raw,{level:9});
     if(!gunzipSync(packed).equals(raw))throw Error('风场压缩校验失败');
     await writeFile(file,packed);
+    timings.wind_pack_and_verify_seconds=(performance.now()-packStart)/1000;
     metrics={bytes:packed.length,sha256:createHash('sha256').update(packed).digest('hex'),wind_grid:{nx:720,ny:361,order:'north_to_south',components:['u','v']}};
   }else{
     let finite=0,min=Infinity,max=-Infinity;
@@ -49,16 +54,30 @@ for(const product of catalog(profile)){
     if(!finite)throw Error('产品全场缺测：'+product.key);
     // 降水保留原场，CAPE 弱平滑；其余沿用已验证的候选参数。
     const sigma=product.kind==='line'?2:product.id==='rain'?0:product.id==='cape'?.5:2;
-    const geo=product.kind==='line'?lineContours(smoothField(data,GRID,sigma),GRID,STYLES[product.id].interval):fillBands(product.id,data,GRID,{sigma});
+    const geometryStart=performance.now();let geo,smoothingSeconds=0;
+    if(product.kind==='line'){
+      const smoothStart=performance.now(),smooth=smoothField(data,GRID,sigma);
+      smoothingSeconds=(performance.now()-smoothStart)/1000;
+      geo=lineContours(smooth,GRID,STYLES[product.id].interval);
+    }else geo=fillBands(product.id,data,GRID,{sigma,onSmoothing:value=>{smoothingSeconds=value;}});
+    timings.smoothing_seconds=smoothingSeconds;
+    timings.contour_geometry_seconds=(performance.now()-geometryStart)/1000-smoothingSeconds;
+    const sourceStart=performance.now();
     await writeFile(folder+'/product.geojson',JSON.stringify(geo));
     const sourceCheck=runPython('./clean_source.py',[folder+'/product.geojson']);
+    if(geo.contour_cleanup)sourceCheck.generated_line_cleanup=geo.contour_cleanup;
     const checked=JSON.parse(await readFile(folder+'/product.geojson','utf8'));
+    timings.source_geometry_validation_seconds=(performance.now()-sourceStart)/1000;
+    const tileStart=performance.now();
     const tiles=await buildTiles(checked,folder,{maxzoom,python});
+    timings.tile_generation_and_validation_seconds=(performance.now()-tileStart)/1000;
     file=`${outputDir}/${product.key}.pmtiles`;
+    const packStart=performance.now();
     metrics={...runPython('./pack_one.py',[folder,file,String(maxzoom)]),finite,min,max,sigma,source_check:sourceCheck,tiles};
+    timings.pmtiles_pack_and_verify_seconds=(performance.now()-packStart)/1000;
   }
   const used=process.cpuUsage(cpu);
-  const row={key:product.key,kind:product.kind,file,status:'verified',...metrics,elapsed_seconds:(performance.now()-start)/1000,cpu_seconds:(used.user+used.system)/1e6};
+  const row={key:product.key,kind:product.kind,file,status:'verified',...metrics,timings,elapsed_seconds:(performance.now()-start)/1000,cpu_seconds:(used.user+used.system)/1e6};
   // Node 的 maxRSS 在各平台均以 KiB 返回。
   row.node_peak_rss_bytes=process.resourceUsage().maxRSS*1024;
   rows.push(row);await writeFile(outputDir+'/products.json',JSON.stringify(rows,null,2)+'\n');

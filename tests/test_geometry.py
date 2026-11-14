@@ -5,6 +5,17 @@ from clean_tiles import clean_feature,decode_rings,clean_lines,exclusive_bands
 from shapely.geometry import Point
 
 class GeometryTests(unittest.TestCase):
+ def test_zero_area_rings_are_counted_and_do_not_remove_real_surface(self):
+  outer=[[0,0],[20,0],[20,20],[0,20],[0,0]]
+  collapsed=[[5,5],[6,5],[7,5],[5,5]]
+  fixed,metric=clean_feature({'type':3,'geometry':[outer,collapsed],'tags':{}})
+  self.assertEqual(metric['degenerate_rings_removed'],1)
+  self.assertEqual(decode_rings(fixed['geometry']).area,400)
+
+ def test_wholly_collapsed_tile_surface_is_legal_and_recorded(self):
+  fixed,metric=clean_feature({'type':3,'geometry':[[[2,3],[2,3],[2,3],[2,3]]],'tags':{}})
+  self.assertEqual(metric['degenerate_rings_removed'],1);self.assertEqual(fixed['geometry'],[])
+
  def test_bands_remain_exclusive_for_translucent_rendering(self):
   a={'type':3,'geometry':[[[0,0],[20,0],[20,20],[0,20],[0,0]]],'tags':{'value':0}}
   b={'type':3,'geometry':[[[10,0],[30,0],[30,20],[10,20],[10,0]]],'tags':{'value':1}}

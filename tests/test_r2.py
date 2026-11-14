@@ -29,6 +29,10 @@ class R2Protocol(unittest.TestCase):
     def test_truncated_list_without_token_fails_closed(self):
         self.stub.add_response('list_objects_v2',{'IsTruncated':True},{'Bucket':'test-bucket'})
         with self.assertRaises(SafetyStop):self.store.list()
+    def test_repeated_continuation_token_does_not_loop_forever(self):
+        self.stub.add_response('list_objects_v2',{'IsTruncated':True,'NextContinuationToken':'same'},{'Bucket':'test-bucket'})
+        self.stub.add_response('list_objects_v2',{'IsTruncated':True,'NextContinuationToken':'same'},{'Bucket':'test-bucket','ContinuationToken':'same'})
+        with self.assertRaises(SafetyStop):self.store.list()
     def test_forbidden_is_not_treated_as_missing(self):
         self.stub.add_client_error('get_object',service_error_code='AccessDenied',http_status_code=403,
             expected_params={'Bucket':'test-bucket','Key':PREFIX+'file.json'})

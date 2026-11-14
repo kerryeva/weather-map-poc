@@ -6,9 +6,20 @@ export function lineContours(values,grid,interval){
  if((max-min)/interval>2000)throw Error('等值线数量异常，请检查单位');
  for(let y=0;y<ny;y++){padded[y*width]=values[y*nx+nx-1];padded.set(values.subarray(y*nx,(y+1)*nx),y*width+1);padded[y*width+nx+1]=values[y*nx];}
  const levels=[];for(let v=Math.ceil(min/interval)*interval;v<=max;v+=interval)levels.push(v);
- const features=[],limit=85.05112878;
+ const features=[],limit=85.05112878,cleanup={duplicate_points_removed:0,zero_length_parts_removed:0};
  for(const contour of contours().size([width,ny]).thresholds(levels).smooth(true)(padded))for(const polygon of contour.coordinates)for(const ring of polygon){
-  let part=[];const emit=()=>{if(part.length>1)features.push({type:'Feature',properties:{value:contour.value},geometry:{type:'LineString',coordinates:part}});part=[];};
+  let part=[];const emit=()=>{
+   // 临界值插值可能在浮点舍入后全部落在同一点；仅去掉连续重复点，不连接不同片段。
+   const unique=[];
+   for(const point of part){
+    const previous=unique.at(-1);
+    if(previous&&previous[0]===point[0]&&previous[1]===point[1])cleanup.duplicate_points_removed++;
+    else unique.push(point);
+   }
+   if(unique.length>1)features.push({type:'Feature',properties:{value:contour.value},geometry:{type:'LineString',coordinates:unique}});
+   else if(part.length>1)cleanup.zero_length_parts_removed++;
+   part=[];
+  };
   for(let i=1;i<ring.length;i++){
    const aa=ring[i-1],bb=ring[i];
    // 全球网格人工封边不能当成物理等值线。
@@ -19,5 +30,5 @@ export function lineContours(values,grid,interval){
    if(part.length&&Math.hypot(part.at(-1)[0]-first[0],part.at(-1)[1]-first[1])>1e-8)emit();if(!part.length)part.push(first);part.push(last);if(hi<1)emit();
   }emit();
  }
- return {type:'FeatureCollection',features};
+ return {type:'FeatureCollection',features,contour_cleanup:cleanup};
 }

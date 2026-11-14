@@ -92,6 +92,9 @@ def execute(command,monitor,log,timeout=1200):
                 time.sleep(.2)
             monitor.check()
             if child.returncode:
+                # 并行处理器失败时，清理同一进程组里的孙进程，不能留下几何任务继续占用CPU。
+                try:os.killpg(child.pid,signal.SIGTERM)
+                except ProcessLookupError:pass
                 raise RuntimeError(f'处理阶段退出码 {child.returncode}；查看本地日志 {log.name}')
         finally:
             if child.poll() is None:
@@ -100,6 +103,7 @@ def execute(command,monitor,log,timeout=1200):
                 except subprocess.TimeoutExpired:
                     os.killpg(child.pid,signal.SIGKILL);child.wait()
             monitor.child=None
+    return time.monotonic()-start
 
 def _download_once(url,path,monitor,session):
     start=time.monotonic();part=path.with_suffix('.part')
@@ -157,9 +161,11 @@ def main():
     parser.add_argument('--leads',default='all')
     parser.add_argument('--profile',choices=['full','500hpa'],default='full')
     parser.add_argument('--maxzoom',type=int,default=5)
+    parser.add_argument('--product-workers',type=int,default=1)
     parser.add_argument('--plan-only',action='store_true')
     args=parser.parse_args()
     if not 0<=args.maxzoom<=5:parser.error('缩放层级只允许0至5')
+    if not 1<=args.product_workers<=4:parser.error('产品并行数只允许1至4')
     work=args.work.resolve();report_path=args.report.resolve()
     if report_path.is_relative_to(work):parser.error('报告必须放在清理目录之外')
     if args.mode=='local' and not args.output:parser.error('local 模式需要 --output')
@@ -183,6 +189,7 @@ def main():
     processing={'profile':args.profile,'maxzoom':args.maxzoom,'leads':[x['lead'] for x in plan],
         'products':definition['products'],'line_sigma':2,'rain_sigma':0,'cape_sigma':.5,'other_fill_sigma':2,
         'version':'ifs-batch-v1','source_code_sha256':source_fingerprint()}
+    processing['product_workers']=args.product_workers
     fingerprint=hashlib.sha256(encoded(processing)).hexdigest()
     run_id=run.strftime('%Y%m%d%H')+'-'+fingerprint[:12]
     report={'status':'planned','mode':args.mode,'run':run.isoformat(),'run_id':run_id,'processing_sha256':fingerprint,
@@ -201,10 +208,15 @@ def main():
                 publisher=Publisher(store)
                 lease=acquire_lease(store)
                 publisher.latest=store.read_json(PREFIX+'latest.json')
+                publisher.available=store.read_json(PREFIX+'available.json')
                 if publisher.latest and publisher.latest['run']>report['run']:
                     raise SafetyStop('不允许以旧起报覆盖更新的完整资料')
                 publisher.prepare(run_id)
-                publisher.reserve_month(datetime.now(UTC).strftime('%Y-%m'),2*(len(definition['products'])*len(plan)+len(plan)+20))
+                # ListObjects 属于A类，不可把所有读取都算作B类。按可能的分页数保守预留。
+                max_objects=len(publisher.objects)+(len(definition['products'])+1)*len(plan)+20
+                max_pages=max(1,(max_objects+999)//1000)
+                reserved_a=2*(len(definition['products'])*len(plan)+len(plan)*2+30+(len(plan)+4)*max_pages)
+                publisher.reserve_month(datetime.now(UTC).strftime('%Y-%m'),reserved_a)
                 publisher.put_json(PREFIX+f'runs/{run_id}/progress.json',{'run':report['run'],'processing_sha256':fingerprint,'status':'incomplete'})
             report['status']='running';save()
             for item in plan:
@@ -213,26 +225,29 @@ def main():
                 if publisher:
                     existing=publisher.store.read_json(manifest_key)
                     if existing and valid_time_manifest(existing,definition,lead,fingerprint) and all(publisher.matches(r['object_key'],r['bytes'],r['md5']) for r in existing['products'] if r['status']=='verified'):
+                        publisher.publish_time(existing)
                         report['times'].append({**existing,'resumed':True});save();continue
                 # 前次失败遗留也只清理本程序标记下的当前时次，不删除任何源项目文件。
                 current=work/'current'
                 if current.exists():shutil.rmtree(current)
                 current.mkdir();source=current/'source.om';outputs=current/'output';scratch=current/'scratch'
                 report['current_lead']=lead;report['disk']=monitor.metrics();save()
+                time_start=time.monotonic()
                 source_metrics=download(item['url'],source,monitor,session)
-                execute([sys.executable,str(ROOT/'scripts/extract.py'),str(source),str(current/'fields'),json.dumps(definition['fields']),str(lead)],
+                extraction_seconds=execute([sys.executable,str(ROOT/'scripts/extract.py'),str(source),str(current/'fields'),json.dumps(definition['fields']),str(lead)],
                     monitor,report_path.parent/f'F{lead:03}-extract.log',timeout=300)
                 source_fields=json.loads((current/'fields/metadata.json').read_text())
                 monitor.sample();monitor.check()
                 job={'fieldsDir':str(current/'fields'),'scratchDir':str(scratch),'outputDir':str(outputs),
-                    'profile':args.profile,'lead':lead,'maxzoom':args.maxzoom,'python':sys.executable}
+                    'profile':args.profile,'lead':lead,'maxzoom':args.maxzoom,'python':sys.executable,'productWorkers':args.product_workers}
                 config=current/'job.json';config.write_text(json.dumps(job))
-                execute(['node','--max-old-space-size=4096',str(ROOT/'scripts/render.mjs'),str(config)],monitor,
+                render_script='render-pool.mjs' if args.product_workers>1 else 'render.mjs'
+                render_seconds=execute(['node','--max-old-space-size=4096',str(ROOT/'scripts'/render_script),str(config)],monitor,
                     report_path.parent/f'F{lead:03}.log')
                 rows=json.loads((outputs/'products.json').read_text())
                 if [r['key'] for r in rows]!=[r['key'] for r in definition['products']]:
                     raise ValueError('生成清单缺少产品或顺序异常')
-                files=[]
+                files=[];verify_start=time.monotonic()
                 for row in rows:
                     if row['status']=='not_applicable':
                         if lead!=0 or '-rain-' not in row['key']:raise ValueError('不允许静默跳过产品')
@@ -241,18 +256,32 @@ def main():
                     if row['status']!='verified' or sha!=row['sha256'] or path.stat().st_size!=row['bytes']:
                         raise ValueError('上传前成品校验不一致')
                     row['md5']=md5;row['object_key']=time_key+path.name;files.append((row['object_key'],path))
-                if publisher:publisher.reserve_time(files)
+                verify_seconds=time.monotonic()-verify_start;reserve_seconds=0
+                if publisher:
+                    reserve_start=time.monotonic();publisher.reserve_time(files);reserve_seconds=time.monotonic()-reserve_start
+                upload_start=time.monotonic()
                 for row in rows:
                     if row['status']!='verified':continue
                     if publisher and not publisher.matches(row['object_key'],row['bytes'],row['md5']):
                         publisher.put(row['object_key'],Path(row['file']),immutable=True)
                     row.pop('file',None)
-                one={**item,'processing_sha256':fingerprint,'products':rows,'source':source_metrics,'source_fields':source_fields,
+                upload_seconds=time.monotonic()-upload_start
+                one={**item,'profile':args.profile,'processing_sha256':fingerprint,'products':rows,'source':source_metrics,'source_fields':source_fields,
                     'product_bytes':sum(r.get('bytes',0) for r in rows),'rain_accumulation_hours':None if lead==0 else 3}
-                if publisher:publisher.put_json(manifest_key,one)
+                one['timings']={'download_seconds':source_metrics['download_seconds'],'extraction_seconds':extraction_seconds,
+                    'render_seconds':render_seconds,'pre_upload_verify_seconds':verify_seconds,
+                    'storage_backend':args.mode,'storage_snapshot_and_reservation_seconds':reserve_seconds,'product_upload_seconds':upload_seconds if publisher else 0}
+                publish_start=time.monotonic()
+                if publisher:
+                    publisher.put_json(manifest_key,one)
+                    publisher.publish_time(one)
+                one['timings']['catalog_publish_seconds']=time.monotonic()-publish_start if publisher else 0
+                one['timings']['time_until_ready_seconds']=time.monotonic()-time_start if publisher else None
                 report['times'].append(one);monitor.sample();monitor.check()
                 report['disk']=monitor.metrics();report['elapsed_seconds']=time.monotonic()-started;save()
-                shutil.rmtree(current)
+                cleanup_start=time.monotonic();shutil.rmtree(current)
+                one['timings']['cleanup_seconds']=time.monotonic()-cleanup_start
+                one['timings']['time_total_seconds']=time.monotonic()-time_start;save()
                 print(json.dumps({'lead':lead,'status':'verified','products':len(files),'bytes':one['product_bytes'],'work_bytes_after_cleanup':directory_bytes(work)}),flush=True)
             if len(report['times'])!=len(plan):raise ValueError('整批时次未全部完成')
             if publisher:
@@ -261,6 +290,7 @@ def main():
                     'product_bytes':sum(t['product_bytes'] for t in report['times']),'attribution':'Open-Meteo / ECMWF, CC BY 4.0'}
                 publisher.put_json(PREFIX+f'runs/{run_id}/manifest.json',manifest)
                 publisher.put_json(PREFIX+'latest.json',manifest)
+                publisher.complete_available([t['lead'] for t in plan])
                 report['store']={'observed_peak_bytes':publisher.peak_bytes,'final_tracked_bytes':publisher.current_bytes,
                     'batch_count':len(publisher.batches),'application_requests':publisher.store.requests,
                     'note':'SDK 自动重试次数不在 application_requests 中；A 类预算按每次调用最多两次尝试预留。'}
