@@ -6,7 +6,7 @@ import {catalog} from '../src/catalog.mjs';
 const config=JSON.parse(await readFile(process.argv[2],'utf8'));
 const count=config.productWorkers;
 if(!Number.isInteger(count)||count<1||count>4)throw Error('产品并行数只允许1至4');
-const products=catalog(config.profile),rows=new Array(products.length),children=new Set();
+const products=catalog(config.profile,config.model??'IFS'),rows=new Array(products.length),children=new Set();
 await mkdir(config.outputDir,{recursive:true});
 await mkdir(config.scratchDir,{recursive:true});
 let next=0,failed=null;

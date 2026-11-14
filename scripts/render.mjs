@@ -28,7 +28,8 @@ function runPython(script,args){
   if(result.status!==0)throw Error(`${script} 失败：${result.stderr}`);
   return JSON.parse(result.stdout);
 }
-const selected=config.productKey?catalog(profile).filter(p=>p.key===config.productKey):catalog(profile);
+const products=catalog(profile,config.model??'IFS');
+const selected=config.productKey?products.filter(p=>p.key===config.productKey):products;
 if(!selected.length)throw Error('产品选择无效');
 for(const product of selected){
   // 起报时刻不存在“前一累计时段”，单独记录，不能伪造零降水。

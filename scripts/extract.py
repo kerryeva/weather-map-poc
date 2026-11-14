@@ -7,6 +7,9 @@ from omfiles import OmFileReader
 
 def main():
     source=Path(sys.argv[1]);fields=Path(sys.argv[2]);variables=json.loads(sys.argv[3]);lead=int(sys.argv[4])
+    domain=sys.argv[5] if len(sys.argv)>5 else 'ecmwf_ifs025'
+    shapes={'ecmwf_ifs025':(721,1440),'ncep_gfs025':(721,1440),'ncep_gfs013':(1536,3072)}
+    if domain not in shapes:raise ValueError('不支持的源网格')
     fields.mkdir();rows=[]
     with OmFileReader(str(source)) as root:
         names={root.get_child_by_index(i).name for i in range(root.num_children)}
@@ -14,7 +17,7 @@ def main():
             if lead==0 and name=='precipitation':continue
             if name not in names:raise ValueError('源文件缺少变量：'+name)
             value=root.get_child_by_name(name).read_array((...,)).astype('<f4')
-            if value.shape!=(721,1440):raise ValueError('IFS 原生网格尺寸变化')
+            if value.shape!=shapes[domain]:raise ValueError(domain+' 原生网格尺寸变化')
             if np.isinf(value).any() or not np.isfinite(value).any():raise ValueError('变量无效：'+name)
             value.tofile(fields/(name+'.f32'))
             rows.append({'variable':name,'shape':list(value.shape),'finite':int(np.isfinite(value).sum()),

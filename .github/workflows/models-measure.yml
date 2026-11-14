@@ -1,0 +1,90 @@
+name: IFS and GFS frozen 82-task resource test
+
+on:
+  push:
+    branches: [codex/dual-model-test]
+    paths: ['.github/workflows/models-measure.yml']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: dual-model-linux-measurement
+  cancel-in-progress: false
+
+jobs:
+  freeze:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      matrix: ${{ steps.freeze.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1
+        with:
+          python-version: '3.12'
+      - run: python -m pip install --no-cache-dir -r requirements.txt
+      - id: freeze
+        run: python3 scripts/freeze_models.py --metadata benchmarks/dual-20261114T00Z.json
+
+  measure:
+    name: ${{ matrix.model }} F${{ matrix.lead }}
+    needs: freeze
+    strategy:
+      fail-fast: false
+      max-parallel: 4
+      matrix: ${{ fromJSON(needs.freeze.outputs.matrix) }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: '26'
+          package-manager-cache: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: '3.12'
+      - name: Install pinned dependencies
+        run: |
+          npm ci --ignore-scripts --no-audit --no-fund
+          python -m pip install --no-cache-dir -r requirements.txt
+      - name: Check fuses and geometry
+        run: |
+          npm test
+          python -m unittest discover -s tests -p 'test_*.py'
+      - name: Measure one lead from the frozen run
+        env:
+          FORECAST_MODEL: ${{ matrix.model }}
+          FORECAST_LEAD: ${{ matrix.lead }}
+        run: |
+          df -h "$RUNNER_TEMP"
+          free -m
+          nproc
+          python scripts/measure_models.py \
+            --work "$RUNNER_TEMP/models-work" \
+            --report "$RUNNER_TEMP/models-evidence/run.json" \
+            --metadata benchmarks/dual-20261114T00Z.json \
+            --model "$FORECAST_MODEL" --profile full --leads "$FORECAST_LEAD" --product-workers 4
+      - name: Preserve bounded diagnostics for failed public-data processing
+        # 本资源任务没有R2凭据；不要把原始处理日志步骤复制到私有发布工作流。
+        if: failure()
+        env:
+          EVIDENCE_DIR: ${{ runner.temp }}/models-evidence
+        run: |
+          python - <<'PY'
+          import os,pathlib
+          for path in sorted(pathlib.Path(os.environ['EVIDENCE_DIR']).glob('F*.log')):
+              with path.open('rb') as stream:
+                  stream.seek(0,2)
+                  stream.seek(max(0,stream.tell()-12000))
+                  print('\nPublic processing log:',path.name)
+                  print(stream.read(12000).decode('utf8',errors='replace'))
+          PY
+      - name: Keep only small public statistics in job log
+        if: always()
+        run: python scripts/summary.py "$RUNNER_TEMP/models-evidence/run.json" --archive-log
+
+# 两模式三个数据域固定同一起报，82任务交错，总并发最多4；仅丢弃模式，无R2发布入口。
+# 不启用schedule、大型运行器、upload-artifact或Actions持久缓存。

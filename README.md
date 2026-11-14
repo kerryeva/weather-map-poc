@@ -1,6 +1,6 @@
 # Open weather map batch test
 
-独立的 IFS 公开格点处理与容量测试程序，不包含浏览器插件代码、内部接口、用户资料或密钥。
+独立的 IFS / GFS 公开格点处理与容量测试程序，不包含浏览器插件代码、内部接口、用户资料或密钥。
 
 当前为测试候选，不能直接视为生产地图服务。包含48种基础产品、6层额外相对涡度，共54个组合，去重读取43个原生变量。500 hPa高度场可作为快速子集。降水/CAPE参数只用于候选容量评估，不代表业务质量已经验收。
 
@@ -84,3 +84,26 @@ npm test
 - R2预算提醒：https://developers.cloudflare.com/billing/manage/budget-alerts/
 
 成功条件：完整批次所有适用产品通过校验；磁盘保留量不被侵占；存储维持两批以内且低于安全阈值；月度读写量外推保留余量。该容量测试不替代私有R2读取、真实终端速度、跨瓦片平滑和业务看图验收。
+
+
+## 双模式一次性资源测试候选（2026-11-14）
+
+本候选新增一个仅支持discard的入口 scripts/measure_models.py，不读取R2凭据，不上传成品。IFS/GFS固定2026-11-14 00UTC，来自三个已完成公开空间目录，覆盖各41个0至120小时、每3小时预报时次，各54产品组合；起报降水明确不适用。新工作流82个时次任务交错，总并发最多4个标准ubuntu-24.04任务，每任务最多4个产品进程，无schedule、Actions缓存、Artifact或付费大型运行器。
+
+GFS 38字段来自ncep_gfs025；地面温度、湿度、10米U/V和降水5字段来自ncep_gfs013。013原生3072×1536网格按上游坐标做双线性重采样到1440×721，包含在计时中。源OM提取后删除，原生字段重采样后删除；每一时次全部生成、校验、统计后删除成品。不在本机长期保存源数据或成品。
+
+雨量遵循当前插件所选源：IFS原生3小时、GFS在0至120小时的原生1小时；每3小时抽帧不等于3小时累计。当前测试不擅自合并GFS三帧，也不能直接将两模式雨量数值比较为同一累计时段。F000不生成降水产品。
+
+命令示例：
+```sh
+python scripts/measure_models.py --model GFS --metadata benchmarks/dual-20261114T00Z.json --work /tmp/gfs-work --report /tmp/gfs-evidence/run.json --leads 3 --product-workers 4
+```
+
+测试通过要求：82个时次任务全部成功；全部产品齐全、原生变量和网格检查通过、源几何/瓦片/打包/哈希检查通过，无保险丝中止；得到两模式分别及合计的成品容量与耗时。F000每模式53文件，其余每时次54文件，预期合计4426文件。对外报告总等待时间、处理时间合计、分阶段耗时、源下载量和临时目录抽样峰值。临时目录峰值不是总RAM峰值。不得把不同起报的旧IFS时间直接当作精确配对加速对照。
+
+本测试不代表R2实际存储或计费、不代表真实浏览器冷热缓存/视觉效果，也不证明生产EWINS可适配。源码基于此前批准的公开167a6c0版本制作，未混入本机尚未公开的滚动35日R2预算、STANDARD改动或本机凭据工具。原有R2工作流不在本次授权运行范围。未来R2整批测试应另行采用修正过的预算版本。
+
+上游依据：
+- https://github.com/open-meteo/open-data （空间布局、7日保留、CC BY 4.0）
+- https://github.com/open-meteo/open-meteo/blob/main/Sources/App/Gfs/GfsDomain.swift （网格坐标、0至120小时发布步长）
+- https://github.com/open-meteo/open-meteo/blob/main/Sources/App/Gfs/GfsVariable.swift （变量、单位、向后累计定义）

@@ -8,7 +8,9 @@ if not args.report.exists():
 report=json.loads(args.report.read_text());times=report.get('times',[])
 total=sum(row.get('product_bytes',0) for row in times)
 disk=report.get('disk',{})
-lines=['# IFS 单批资源测试',f"状态：{report['status']}",f"起报：{report['run']}",
+model=report.get('processing',{}).get('model','IFS')
+if model not in ('IFS','GFS'):raise ValueError('未知报告模式')
+lines=[f'# {model} 单批资源测试',f"状态：{report['status']}",f"起报：{report['run']}",
     f"范围：{report['processing']['profile']}；完成时次：{len(times)}/{len(report['plan'])}",
     f"成品合计：{total/1e9:.6f} GB（此任务模式：{report['mode']}）",
     f"耗时：{report.get('elapsed_seconds',0)/60:.2f} 分钟",

@@ -25,8 +25,9 @@ export function colorFor(id, value) {
   return colors.at(-1);
 }
 
-export function catalog(profile='full') {
+export function catalog(profile='full',model='IFS') {
   if (!['full','500hpa'].includes(profile)) throw Error('未知产品范围');
+  if (!['IFS','GFS'].includes(model)) throw Error('未知预报模式');
   const result=[];
   for (const level of ['surface',1000,925,850,700,500,200]) {
     const ids=level==='surface' ? ['pressure','wind','temp','rh','rain','cape'] : ['height','wind','temp','dew','vort','div','vertical'];
@@ -35,7 +36,7 @@ export function catalog(profile='full') {
       const suffix=level==='surface'?'2m':`${level}hPa`, wind=level==='surface'?'10m':suffix;
       const inputs={pressure:['pressure_msl'],height:[`geopotential_height_${suffix}`],wind:[`wind_u_component_${wind}`,`wind_v_component_${wind}`],temp:[`temperature_${suffix}`],rh:['relative_humidity_2m'],rain:['precipitation'],cape:['cape'],dew:[`temperature_${suffix}`,`relative_humidity_${suffix}`],vort:[`wind_u_component_${wind}`,`wind_v_component_${wind}`],div:[`wind_u_component_${wind}`,`wind_v_component_${wind}`],vertical:[`vertical_velocity_${suffix}`,`temperature_${suffix}`]}[id];
       for (const variant of id==='vort'?['absolute','relative']:['default']) {
-        result.push({key:`IFS-${level}-${id}-${variant}`,level,id,variant,inputs,kind:id==='wind'?'wind':STYLES[id].interval?'line':'fill'});
+        result.push({key:`${model}-${level}-${id}-${variant}`,level,id,variant,inputs,kind:id==='wind'?'wind':STYLES[id].interval?'line':'fill'});
       }
     }
   }
@@ -43,3 +44,12 @@ export function catalog(profile='full') {
 }
 
 export const fieldsFor = profile => [...new Set(catalog(profile).flatMap(p=>p.inputs))].sort();
+
+export function fieldSources(profile='full',model='IFS') {
+  const fields=new Map();
+  for(const product of catalog(profile,model)) {
+    const domain=model==='IFS'?'ecmwf_ifs025':product.level==='surface'&&!['pressure','cape'].includes(product.id)?'ncep_gfs013':'ncep_gfs025';
+    for(const variable of product.inputs)fields.set(variable,{variable,domain});
+  }
+  return [...fields.values()].sort((a,b)=>a.variable.localeCompare(b.variable));
+}
