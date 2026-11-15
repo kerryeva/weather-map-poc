@@ -2,6 +2,7 @@
 import argparse
 import json
 import os
+import re
 import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -105,6 +106,29 @@ def select_job(store, model, now, fetch):
     return 'no newer complete source; last published: ' + (completed or 'none'), None
 
 
+def processor_revision(store, cycle, current):
+    """同一次起报从第一次开工到续跑都使用同一版制图程序。"""
+    available = store.read_json(store.prefix + 'available.json') or {}
+    run_id = available.get('run_id', '')
+    attempt = store.read_json(store.prefix + 'scheduler-attempt.json') or {}
+    revision = current
+    if run_id[:10] == cycle and not available.get('complete'):
+        if not RUN_ID.fullmatch(run_id):
+            raise SafetyStop('正在制作的批次编号无效')
+        progress = store.read_json(store.prefix + 'runs/' + run_id + '/progress.json') or {}
+        revision = progress.get('processor_commit')
+        if not revision and attempt.get('cycle') == cycle:
+            revision = attempt.get('processor_commit')
+        # 升级前已在两个正式桶发布的批次没有记录提交号。
+        if not revision and run_id in ('2026111418-35409f439bc2', '2026111418-b72254d378ed'):
+            revision = 'b6340d697af566e3ffaf96f595c729c88bb698c7'
+        if not revision:
+            raise SafetyStop('在制起报缺少制图版本，保留现有资料')
+    if not re.fullmatch(r'[0-9a-f]{40}', revision):
+        raise SafetyStop('制图版本标识异常')
+    return revision
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('phase', choices=['check', 'begin'])
@@ -121,16 +145,20 @@ def main():
         attempt_key = store.prefix + 'scheduler-attempt.json'
         previous = store.read_json(attempt_key) or {}
         delay = min(6, previous.get('hours', 0) * 2 or 1) if previous.get('cycle') == cycle_id(run) else 1
-        store.put(attempt_key, encoded({'cycle':cycle_id(run),'hours':delay,'retry_after':now.timestamp()+delay*3600}))
+        store.put(attempt_key, encoded({'cycle':cycle_id(run),'processor_commit':os.environ['PROCESSOR_COMMIT'],'hours':delay,'retry_after':now.timestamp()+delay*3600}))
         return
     spec = definition(model, 'full')
     with requests.Session() as session:
         message, bundle = select_job(store, model, now, lambda run: read_cycle(spec, run, session))
+    revision = ''
     if bundle:
+        run = stamp(next(iter(bundle.values()))['reference_time'])
+        revision = processor_revision(store, cycle_id(run), os.environ['GITHUB_SHA'])
         path.write_text(json.dumps(bundle))
     print(model, message)
     with open(os.environ['GITHUB_OUTPUT'], 'a') as out:
         print('publish=' + ('true' if bundle else 'false'), file=out)
+        print('processor=' + revision, file=out)
     with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as out:
         print(f'{model} — {message}', file=out)
 

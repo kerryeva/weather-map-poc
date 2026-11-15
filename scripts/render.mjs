@@ -5,6 +5,7 @@ import {spawnSync} from 'node:child_process';
 import {endianness} from 'node:os';
 import {catalog,GRID,STYLES} from '../src/catalog.mjs';
 import {derive} from '../src/fields.mjs';
+import {RAIN_TRACE_SIGMA} from '../src/rain.mjs';
 import {smoothField} from '../src/smoothing.mjs';
 import {lineContours} from '../src/lines.mjs';
 import {fillBands} from '../src/fill.mjs';
@@ -53,8 +54,8 @@ for(const product of selected){
     let finite=0,min=Infinity,max=-Infinity;
     for(const v of data){if(v===Infinity||v===-Infinity)throw Error('产品含无穷值');if(Number.isFinite(v)){finite++;min=Math.min(min,v);max=Math.max(max,v);}}
     if(!finite)throw Error('产品全场缺测：'+product.key);
-    // 降水保留原场，CAPE 弱平滑；其余沿用已验证的候选参数。
-    const sigma=product.kind==='line'?2:product.id==='rain'?0:product.id==='cape'?.5:2;
+    // 降水的 sigma 只描述最低色阶；高色阶格点保留原值。
+    const sigma=product.kind==='line'?2:product.id==='rain'?RAIN_TRACE_SIGMA:product.id==='cape'?.5:2;
     const geometryStart=performance.now();let geo,smoothingSeconds=0;
     if(product.kind==='line'){
       const smoothStart=performance.now(),smooth=smoothField(data,GRID,sigma);

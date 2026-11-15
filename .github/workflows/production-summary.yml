@@ -1,0 +1,38 @@
+name: Record production activity
+on:
+  schedule:
+    - cron: '37 3 1 * *'
+  push:
+    branches: [main]
+    paths: ['.github/workflows/production-summary.yml']
+permissions: {}
+jobs:
+  report:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      actions: read
+      contents: write
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+      - name: Record recent scheduled checks
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          since=$(date -u -d '7 days ago' +%FT%TZ)
+          gh api --method GET --paginate "repos/$GITHUB_REPOSITORY/actions/workflows/publish-models.yml/runs" \
+            -f event=schedule -f branch=main -f "created=>=$since" -f per_page=100 \
+            --jq '.workflow_runs[] | {created_at, status, conclusion, html_url}' > "$RUNNER_TEMP/checks.jsonl"
+          mkdir -p operations
+          jq -s --arg at "$(date -u +%FT%TZ)" --arg since "$since" \
+            '{recorded_at:$at, window_start:$since, scheduled_checks:length,
+              completed_success:map(select(.conclusion=="success"))|length,
+              completed_failure:map(select(.conclusion=="failure"))|length,
+              latest_check:(max_by(.created_at) // null)}' \
+            "$RUNNER_TEMP/checks.jsonl" > operations/last-schedule-report.json
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add operations/last-schedule-report.json
+          git commit -m 'Record monthly forecast scheduler activity'
+          git pull --rebase origin main
+          git push origin HEAD:main

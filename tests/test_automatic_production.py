@@ -59,3 +59,16 @@ class AutomaticProduction(unittest.TestCase):
         writes=self.store.requests['put']
         self.assertIsNone(self.plan(fetch)[1])
         self.assertEqual(writes,self.store.requests['put'])
+
+    def test_resume_keeps_processor_while_new_cycle_uses_current(self):
+        current = 'c' * 40
+        old = 'b' * 40
+        self.store.put(self.prefix+'available.json', encoded({'run_id': self.run_id, 'complete':False}))
+        self.store.put(self.prefix+'runs/'+self.run_id+'/progress.json', encoded({'processor_commit': old}))
+        self.assertEqual(prod.processor_revision(self.store,'2026111500',current),old)
+        self.assertEqual(prod.processor_revision(self.store,'2026111512',current),current)
+
+    def test_legacy_first_run_recovers_with_original_processor(self):
+        self.store.put(self.prefix+'available.json', encoded({'run_id':'2026111418-b72254d378ed','complete':False}))
+        self.assertEqual(prod.processor_revision(self.store,'2026111418','a'*40),
+                         'b6340d697af566e3ffaf96f595c729c88bb698c7')

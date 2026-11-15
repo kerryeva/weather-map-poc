@@ -201,7 +201,7 @@ def main():
         for item in plan:
             item['sources']=[{'domain':'ecmwf_ifs025','url':item['url']}]
     processing={'model':model,'profile':args.profile,'maxzoom':args.maxzoom,'leads':[x['lead'] for x in plan],
-        'products':definition['products'],'line_sigma':2,'rain_sigma':0,'cape_sigma':.5,'other_fill_sigma':2,
+        'products':definition['products'],'line_sigma':2,'rain_trace_sigma':0.6,'rain_display_subdivision':2,'cape_sigma':.5,'other_fill_sigma':2,
         'version':'weather-tiles-v1' if args.model else 'ifs-batch-v1','source_code_sha256':source_fingerprint()}
     processing['product_workers']=args.product_workers
     fingerprint=hashlib.sha256(encoded(processing)).hexdigest()
@@ -237,7 +237,7 @@ def main():
                 reserved_a=2*(len(definition['products'])*len(plan)+len(plan)*2+30+(len(plan)+4)*max_pages)
                 publisher.reserve_operations(datetime.now(UTC).date().isoformat(),reserved_a)
                 publisher.prepare(run_id)
-                publisher.put_json(prefix+f'runs/{run_id}/progress.json',{'run':report['run'],'processing_sha256':fingerprint,'status':'incomplete'})
+                publisher.put_json(prefix+f'runs/{run_id}/progress.json',{'run':report['run'],'processing_sha256':fingerprint,'processor_commit':os.environ.get('PROCESSOR_COMMIT'),'status':'incomplete'})
             report['status']='running';save()
             for item in plan:
                 if time.monotonic()-started>5*3600:raise SafetyStop('整批任务接近时间上限')

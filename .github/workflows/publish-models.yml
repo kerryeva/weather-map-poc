@@ -30,6 +30,9 @@ jobs:
       cancel-in-progress: false
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+        with:
+          fetch-depth: 0
+          persist-credentials: false
       - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38
         with:
           node-version: '26'
@@ -50,6 +53,13 @@ jobs:
           TARGET_KEY: ${{ secrets[format('{0}_R2_ACCESS_KEY_ID', matrix.model)] }}
           TARGET_SECRET: ${{ secrets[format('{0}_R2_SECRET_ACCESS_KEY', matrix.model)] }}
         run: python automation/production.py check
+      - name: Restore processor for an interrupted cycle
+        if: steps.readiness.outputs.publish == 'true' && steps.readiness.outputs.processor != github.sha
+        env:
+          REVISION: ${{ steps.readiness.outputs.processor }}
+        run: |
+          git merge-base --is-ancestor "$REVISION" "$GITHUB_SHA"
+          git restore --source="$REVISION" -- scripts src package.json package-lock.json requirements.txt
       - name: Install processor
         if: env.SCOPE != 'auto' || steps.readiness.outputs.publish == 'true'
         run: |
@@ -63,6 +73,7 @@ jobs:
           TARGET_BUCKET: ${{ secrets[format('{0}_R2_BUCKET', matrix.model)] }}
           TARGET_KEY: ${{ secrets[format('{0}_R2_ACCESS_KEY_ID', matrix.model)] }}
           TARGET_SECRET: ${{ secrets[format('{0}_R2_SECRET_ACCESS_KEY', matrix.model)] }}
+          PROCESSOR_COMMIT: ${{ steps.readiness.outputs.processor || github.sha }}
         shell: bash
         run: |
           export "${MODEL}_R2_BUCKET=$TARGET_BUCKET" "${MODEL}_R2_ACCESS_KEY_ID=$TARGET_KEY" "${MODEL}_R2_SECRET_ACCESS_KEY=$TARGET_SECRET"

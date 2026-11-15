@@ -2,6 +2,7 @@ import {contours} from 'd3-contour';
 import polygonClipping from 'polygon-clipping';
 import {STYLES as DEFINITIONS,colorFor as fillColor} from './catalog.mjs';
 import {smoothField} from './smoothing.mjs';
+import {rainDisplayGrid} from './rain.mjs';
 
 // 用相邻双精度数表达闭区间/严格大于，避免固定 epsilon 错分临界值。
 function nextAbove(value){const b=new DataView(new ArrayBuffer(8));b.setFloat64(0,value);b.setBigUint64(0,b.getBigUint64(0)+1n);return b.getFloat64(0);}
@@ -9,7 +10,10 @@ function nextAbove(value){const b=new DataView(new ArrayBuffer(8));b.setFloat64(
 // 先生成共享阈值区域再求差。此处不各自平滑/简化相邻色带的边界。
 export function fillBands(id,values,grid,{sigma=0,onSmoothing}={}){
  const definition=DEFINITIONS[id];if(!definition?.breaks)throw Error('产品不是分级填色');
- const smoothStart=performance.now(),field=smoothField(values,grid,sigma);
+ const smoothStart=performance.now();
+ let field;
+ if(id==='rain')({field,grid}=rainDisplayGrid(values,grid));
+ else field=smoothField(values,grid,sigma);
  onSmoothing?.((performance.now()-smoothStart)/1000);
  let min=Infinity,max=-Infinity;
  for(const v of field)if(Number.isFinite(v)){min=Math.min(min,v);max=Math.max(max,v);}
