@@ -1,0 +1,26 @@
+name: Recover forecast schedule
+on:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/scheduler-recovery.yml']
+  workflow_dispatch:
+permissions:
+  actions: write
+jobs:
+  recover:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 3
+    env:
+      GH_TOKEN: ${{ github.token }}
+      REPOSITORY: ${{ github.repository }}
+    steps:
+      - name: Inspect scheduler registration
+        run: gh api "repos/$REPOSITORY/actions/workflows/publish-models.yml" --jq '{id, state, path}'
+      - name: Re-enable forecast schedule
+        if: github.event_name != 'schedule'
+        run: |
+          endpoint="repos/$REPOSITORY/actions/workflows/publish-models.yml"
+          trap 'gh api --method PUT "$endpoint/enable"' EXIT
+          gh api --method PUT "$endpoint/disable"
+          gh api --method PUT "$endpoint/enable"
+          gh api "$endpoint" --jq '{id, state, path}'
