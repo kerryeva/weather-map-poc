@@ -1,8 +1,8 @@
 // 降水显示场。仅最低色阶参与弱平滑，较高色阶的原格点保留预报量。
-import {smoothField} from './smoothing.mjs';
+import {smoothRainTrace} from './smoothing.mjs';
 import {STYLES} from './catalog.mjs';
 
-export const RAIN_TRACE_SIGMA = 0.6;
+export const RAIN_TRACE_SIGMA = 1;
 
 function slope(left, right) {
   return left * right > 0 ? 2 * left * right / (left + right) : 0;
@@ -19,7 +19,7 @@ export function rainDisplayGrid(values, grid) {
   const {nx, ny} = grid;
   const ceiling = STYLES.rain.breaks[1];
   if (values.some(v => v === Infinity || v === -Infinity)) throw Error('降水格点含无穷值');
-  const weak = smoothField(Float32Array.from(values, v => Math.min(v, ceiling)), grid, RAIN_TRACE_SIGMA);
+  const weak = smoothRainTrace(Float32Array.from(values, v => Math.min(v, ceiling)), grid);
   for (let i = 0; i < weak.length; i++) {
     // 也避免弱降水因 Float32 舍入进入更高色阶。
     if (values[i] >= ceiling || weak[i] >= ceiling) weak[i] = values[i];

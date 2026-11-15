@@ -29,3 +29,11 @@ test('经度接缝、缺测和各较高雨量等级在绘图加密后保持一�
     assert.ok(field.every(v => Number.isNaN(v) || (v >= 0 && v <= amount)));
   }
 });
+
+test('0 与 0.2 毫米相间的格点在雨带内部形成连续起填区', () => {
+  const values = Float32Array.from({length:grid.nx*grid.ny},
+    (_,i) => ((i%grid.nx + Math.floor(i/grid.nx))%2) * 0.2);
+  const {field,grid: refined} = rainDisplayGrid(values,grid);
+  const middle = field.slice(6*refined.nx,10*refined.nx);
+  assert.ok(middle.every(v => v === Math.fround(0.1)));
+});

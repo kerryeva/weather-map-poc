@@ -201,7 +201,7 @@ def main():
         for item in plan:
             item['sources']=[{'domain':'ecmwf_ifs025','url':item['url']}]
     processing={'model':model,'profile':args.profile,'maxzoom':args.maxzoom,'leads':[x['lead'] for x in plan],
-        'products':definition['products'],'line_sigma':2,'rain_trace_sigma':0.6,'rain_display_subdivision':2,'cape_sigma':.5,'other_fill_sigma':2,
+        'products':definition['products'],'line_sigma':2,'rain_trace_kernel':[1,4,6,4,1],'rain_display_subdivision':2,'cape_sigma':.5,'other_fill_sigma':2,
         'version':'weather-tiles-v1' if args.model else 'ifs-batch-v1','source_code_sha256':source_fingerprint()}
     processing['product_workers']=args.product_workers
     fingerprint=hashlib.sha256(encoded(processing)).hexdigest()
