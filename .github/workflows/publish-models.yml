@@ -1,12 +1,17 @@
 name: Publish IFS and GFS tiles
 on:
+  schedule:
+    - cron: '17,47 * * * *'
+  push:
+    branches: [main]
+    paths: ['.github/workflows/publish-models.yml']
   workflow_dispatch:
     inputs:
       scope:
         description: Published products
         type: choice
-        options: [height, full]
-        default: height
+        options: [auto, height, full]
+        default: auto
 permissions:
   contents: read
 jobs:
@@ -17,8 +22,11 @@ jobs:
         model: [IFS, GFS]
     runs-on: ubuntu-24.04
     timeout-minutes: 330
+    env:
+      MODEL: ${{ matrix.model }}
+      SCOPE: ${{ inputs.scope || 'auto' }}
     concurrency:
-      group: publish-weather-${{ matrix.model }}
+      group: auto-weather-${{ matrix.model }}
       cancel-in-progress: false
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
@@ -29,14 +37,27 @@ jobs:
       - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1
         with:
           python-version: '3.12'
+      - name: Install readiness checker
+        if: env.SCOPE == 'auto'
+        run: python -m pip install --disable-pip-version-check requests==2.32.3 boto3==1.44.3
+      - name: Inspect upstream and published cycle
+        id: readiness
+        if: env.SCOPE == 'auto'
+        env:
+          IFS_R2_ACCOUNT_ID: ${{ secrets.IFS_R2_ACCOUNT_ID }}
+          GFS_R2_ACCOUNT_ID: ${{ secrets.GFS_R2_ACCOUNT_ID }}
+          TARGET_BUCKET: ${{ secrets[format('{0}_R2_BUCKET', matrix.model)] }}
+          TARGET_KEY: ${{ secrets[format('{0}_R2_ACCESS_KEY_ID', matrix.model)] }}
+          TARGET_SECRET: ${{ secrets[format('{0}_R2_SECRET_ACCESS_KEY', matrix.model)] }}
+        run: python automation/production.py check
       - name: Install processor
+        if: env.SCOPE != 'auto' || steps.readiness.outputs.publish == 'true'
         run: |
           npm ci --ignore-scripts --no-audit --no-fund
           python -m pip install --no-cache-dir -r requirements.txt
       - name: Publish to model's private R2 bucket
+        if: env.SCOPE != 'auto' || steps.readiness.outputs.publish == 'true'
         env:
-          MODEL: ${{ matrix.model }}
-          SCOPE: ${{ inputs.scope }}
           IFS_R2_ACCOUNT_ID: ${{ secrets.IFS_R2_ACCOUNT_ID }}
           GFS_R2_ACCOUNT_ID: ${{ secrets.GFS_R2_ACCOUNT_ID }}
           TARGET_BUCKET: ${{ secrets[format('{0}_R2_BUCKET', matrix.model)] }}
@@ -45,10 +66,14 @@ jobs:
         shell: bash
         run: |
           export "${MODEL}_R2_BUCKET=$TARGET_BUCKET" "${MODEL}_R2_ACCESS_KEY_ID=$TARGET_KEY" "${MODEL}_R2_SECRET_ACCESS_KEY=$TARGET_SECRET"
+          metadata=()
           case "$SCOPE" in
+            auto)
+              python automation/production.py begin
+              profile=full; leads=all; metadata=(--metadata "$RUNNER_TEMP/scheduled-metadata.json") ;;
             height) profile=500hpa; leads=0 ;;
             full) profile=full; leads=all ;;
             *) exit 2 ;;
           esac
-          python scripts/batch.py --model "$MODEL" --profile "$profile" --leads "$leads" --mode r2 \
+          python scripts/batch.py "${metadata[@]}" --model "$MODEL" --profile "$profile" --leads "$leads" --mode r2 \
             --product-workers 4 --work "$RUNNER_TEMP/work" --report "$RUNNER_TEMP/report/run.json"
