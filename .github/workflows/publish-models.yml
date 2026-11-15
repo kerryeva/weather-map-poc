@@ -1,0 +1,54 @@
+name: Publish IFS and GFS tiles
+on:
+  workflow_dispatch:
+    inputs:
+      scope:
+        description: Published products
+        type: choice
+        options: [height, full]
+        default: height
+permissions:
+  contents: read
+jobs:
+  publish:
+    strategy:
+      fail-fast: false
+      matrix:
+        model: [IFS, GFS]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 330
+    concurrency:
+      group: publish-weather-${{ matrix.model }}
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38
+        with:
+          node-version: '26'
+          package-manager-cache: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1
+        with:
+          python-version: '3.12'
+      - name: Install processor
+        run: |
+          npm ci --ignore-scripts --no-audit --no-fund
+          python -m pip install --no-cache-dir -r requirements.txt
+      - name: Publish to model's private R2 bucket
+        env:
+          MODEL: ${{ matrix.model }}
+          SCOPE: ${{ inputs.scope }}
+          IFS_R2_ACCOUNT_ID: ${{ secrets.IFS_R2_ACCOUNT_ID }}
+          GFS_R2_ACCOUNT_ID: ${{ secrets.GFS_R2_ACCOUNT_ID }}
+          TARGET_BUCKET: ${{ secrets[format('{0}_R2_BUCKET', matrix.model)] }}
+          TARGET_KEY: ${{ secrets[format('{0}_R2_ACCESS_KEY_ID', matrix.model)] }}
+          TARGET_SECRET: ${{ secrets[format('{0}_R2_SECRET_ACCESS_KEY', matrix.model)] }}
+        shell: bash
+        run: |
+          export "${MODEL}_R2_BUCKET=$TARGET_BUCKET" "${MODEL}_R2_ACCESS_KEY_ID=$TARGET_KEY" "${MODEL}_R2_SECRET_ACCESS_KEY=$TARGET_SECRET"
+          case "$SCOPE" in
+            height) profile=500hpa; leads=0 ;;
+            full) profile=full; leads=all ;;
+            *) exit 2 ;;
+          esac
+          python scripts/batch.py --model "$MODEL" --profile "$profile" --leads "$leads" --mode r2 \
+            --product-workers 4 --work "$RUNNER_TEMP/work" --report "$RUNNER_TEMP/report/run.json"
