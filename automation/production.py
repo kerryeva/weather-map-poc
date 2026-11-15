@@ -92,7 +92,11 @@ def candidate_runs(now, completed, unfinished):
         run += CYCLE
 
 
-def select_job(store, model, now, fetch):
+# 未记录容量的旧任务使用 polygon-clipping 默认的一百万个端点。
+DEFAULT_QUEUE_LIMIT = 1_000_000
+
+
+def select_job(store, model, now, fetch, queue_limit=DEFAULT_QUEUE_LIMIT):
     prefix = store.prefix
     available = store.read_json(prefix + 'available.json') or {}
     lock = store.read_json(PREFIX + 'writer-lock.json')
@@ -113,7 +117,9 @@ def select_job(store, model, now, fetch):
         if bundle:
             attempt = store.read_json(prefix + 'scheduler-attempt.json') or {}
             if attempt.get('cycle') == cycle_id(run) and now.timestamp() < attempt['retry_after']:
-                return 'retry cooling down: ' + cycle_id(run), None
+                larger_queue = queue_limit > attempt.get('queue_limit', DEFAULT_QUEUE_LIMIT)
+                if unfinished != cycle_id(run) or not larger_queue:
+                    return 'retry cooling down: ' + cycle_id(run), None
             return 'ready: ' + model + ' ' + cycle_id(run), bundle
     if completed and now-datetime.strptime(completed,'%Y%m%d%H').replace(tzinfo=UTC)>timedelta(hours=30):
         raise RuntimeError('发布目录超过30小时未更新，未发现可运行的完整源；下个定时任务会继续检查')
@@ -154,16 +160,17 @@ def main():
     store = model_store(model, 'weather-v1/' + model.lower() + '/full/')
     path = Path(os.environ['RUNNER_TEMP']) / 'scheduled-metadata.json'
     now = datetime.now(UTC)
+    queue_limit = int(os.environ.get('POLYGON_CLIPPING_MAX_QUEUE_SIZE', DEFAULT_QUEUE_LIMIT))
     if args.phase == 'begin':
         run = stamp(next(iter(json.loads(path.read_text()).values()))['reference_time'])
         attempt_key = store.prefix + 'scheduler-attempt.json'
         previous = store.read_json(attempt_key) or {}
         delay = min(6, previous.get('hours', 0) * 2 or 1) if previous.get('cycle') == cycle_id(run) else 1
-        store.put(attempt_key, encoded({'cycle':cycle_id(run),'processor_commit':os.environ['PROCESSOR_COMMIT'],'hours':delay,'retry_after':now.timestamp()+delay*3600}))
+        store.put(attempt_key, encoded({'cycle':cycle_id(run),'processor_commit':os.environ['PROCESSOR_COMMIT'],'hours':delay,'queue_limit':queue_limit,'retry_after':now.timestamp()+delay*3600}))
         return
     spec = definition(model, 'full')
     with requests.Session() as session:
-        message, bundle = select_job(store, model, now, lambda run: read_cycle(spec, run, session))
+        message, bundle = select_job(store, model, now, lambda run: read_cycle(spec, run, session), queue_limit)
     revision = ''
     if bundle:
         run = stamp(next(iter(bundle.values()))['reference_time'])

@@ -38,6 +38,18 @@ class AutomaticProduction(unittest.TestCase):
         self.store.put(self.prefix+'scheduler-attempt.json',encoded({'cycle':'2026111506','retry_after':self.now.timestamp()+60}))
         self.assertIsNone(self.plan(lambda _:self.bundle)[1])
 
+    def test_larger_queue_retries_interrupted_cycle_once(self):
+        attempt = {'cycle':'2026111500', 'retry_after':self.now.timestamp()+3600}
+        key = self.prefix+'scheduler-attempt.json'
+        self.store.put(self.prefix+'available.json', encoded({'run_id':self.run_id,'complete':False}))
+        self.store.put(key, encoded(attempt))
+        def plan(limit):
+            return prod.select_job(self.store, 'IFS', self.now, lambda _:self.bundle, limit)[1]
+        self.assertIsNone(plan(1_000_000))
+        self.assertEqual(plan(2_000_000), self.bundle)
+        self.store.put(key, encoded({**attempt, 'queue_limit':2_000_000}))
+        self.assertIsNone(plan(2_000_000))
+
     def test_resumes_first_incomplete_even_for_original_18z(self):
         self.store.put(self.prefix+'available.json',encoded({'run_id':'2026111418-'+'b'*12,'complete':False}))
         seen=[]
