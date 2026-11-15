@@ -63,3 +63,21 @@ test('全部7个风场共用缺测拦截，不能把缺测伪造成零风',()=>{
     u[0]=NaN;assert.throws(()=>derive(product,[u,v]),/风场存在缺测/);u[0]=3;
   }
 });
+
+test('动力填色的分档、零值和两个严格越界的端点',async()=>{
+  const {dynamicScale}=await import('../src/dynamic-scales.mjs');
+  const grid={nx:8,ny:5,lonMin:-180,latMin:-90,dx:45,dy:45};
+  for(const [id,variant,max,step] of [['div','default',15,3],['vertical','default',24,3],['vort','relative',18,2]]){
+    const scale=dynamicScale(id,variant);
+    assert.deepEqual(scale.breaks,Array.from({length:2*max/step+1},(_,i)=>i*step-max));
+    assert.equal(new Set(scale.colors).size,scale.breaks.length+1);
+    for(const [value,expected] of [[-max-1,scale.colors[0]],[-max,scale.colors[1]],[-0.1,scale.colors[max/step]],
+      [0,null],[0.1,scale.colors[max/step+1]],[max,scale.colors.at(-2)],[max+1,scale.colors.at(-1)]]){
+      const geo=fillBands(id,new Float32Array(40).fill(value),grid,{variant});
+      assert.deepEqual(geo.features.map(f=>[f.properties.color,f.properties.scaleVersion]),expected?[[expected,2]]:[]);
+    }
+  }
+  assert.equal(dynamicScale('vort','absolute'),null);
+  const temp=new Float32Array([0]),w=new Float32Array([1]);
+  assert.equal(derive({id:'vertical',level:500},[w,temp])[0],Math.fround(10*omega(1,0,500)));
+});

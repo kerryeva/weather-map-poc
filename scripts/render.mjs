@@ -61,7 +61,7 @@ for(const product of selected){
       const smoothStart=performance.now(),smooth=smoothField(data,GRID,sigma);
       smoothingSeconds=(performance.now()-smoothStart)/1000;
       geo=lineContours(smooth,GRID,STYLES[product.id].interval);
-    }else geo=fillBands(product.id,data,GRID,{sigma,onSmoothing:value=>{smoothingSeconds=value;}});
+    }else geo=fillBands(product.id,data,GRID,{sigma,variant:product.variant,onSmoothing:value=>{smoothingSeconds=value;}});
     timings.smoothing_seconds=smoothingSeconds;
     timings.contour_geometry_seconds=(performance.now()-geometryStart)/1000-smoothingSeconds;
     const sourceStart=performance.now();

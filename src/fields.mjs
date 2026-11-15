@@ -40,7 +40,7 @@ export function derive(product,inputs,cache=new Map()) {
     return packed;
   }
   if (product.id==='dew') return Float32Array.from(inputs[0],(t,i)=>dewpointSpread(t,inputs[1][i]));
-  if (product.id==='vertical') return Float32Array.from(inputs[0],(w,i)=>omega(w,inputs[1][i],Number(product.level)));
+  if (product.id==='vertical') return Float32Array.from(inputs[0],(w,i)=>10*omega(w,inputs[1][i],Number(product.level)));
   if (['vort','div'].includes(product.id)) {
     const key=product.level;
     if (!cache.has(key)) cache.set(key,dynamics(...inputs));

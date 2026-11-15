@@ -1,3 +1,4 @@
+import {dynamicScale,dynamicColor} from './dynamic-scales.mjs';
 // 独立的公开数据产品定义。此模块不读取浏览器插件、内部接口或用户资料。
 export const GRID = {nx:1440, ny:721, lonMin:-180, latMin:-90, dx:.25, dy:.25};
 export const DOMAIN = 'ecmwf_ifs025';
@@ -12,12 +13,13 @@ export const STYLES = {
   rain:bands([.1,1,2.5,5,10,25,50,100], ['#c0e5d5','#8bceaa','#4fad83','#219eac','#357db4','#6655ad','#a43c9b']),
   cape:bands(Array.from({length:37}, (_,i)=>500+i*100), Array.from({length:36}, (_,i)=>`rgb(${Math.round(211-i*3.8)},${Math.round(184-i*4.2)},${Math.round(232-i*2.4)})`)),
   vort:bands([-40,-20,-12,-8,-4,4,8,12,20,40], ['#187e9c','#339bbb','#69b6ca','#aed6df',null,'#fff0aa','#f4d364','#dfad31','#bb811b']),
-  div:bands([-40,-20,-10,-5,-2,2,5,10,20,40], ['#24549e','#4383bb','#70a7cf','#b4d4e9',null,'#f9c0b7','#ec8c7e','#d85e52','#aa3037']),
-  vertical:bands([-5,-2,-1,-.5,-.1,.1,.5,1,2,5], ['#155184','#2a7fac','#63a9c6','#b4dce6',null,'#f8c6bc','#ee978c','#d66770','#a23964'])
+  div:dynamicScale('div'),
+  vertical:dynamicScale('vertical'),
 };
 
-export function colorFor(id, value) {
+export function colorFor(id, value, variant) {
   if (!Number.isFinite(value)) return null;
+  const scale=dynamicScale(id,variant);if(scale)return dynamicColor(scale,value);
   const {breaks,colors} = STYLES[id];
   if (id==='cape' && value<=500 || id==='dew' && (value<0||value>4) || id==='rh' && (value<85||value>100)) return null;
   if (value<breaks[0]) return ['vort','div','vertical'].includes(id) ? colors[0] : null;
