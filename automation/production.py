@@ -1,4 +1,4 @@
-"""00/12 UTC 自动生产入口。仅在需要制图时让工作流安装完整依赖。"""
+"""00/06/12/18 UTC 自动生产入口。仅在需要制图时让工作流安装完整依赖。"""
 import argparse
 import json
 import os
@@ -17,6 +17,7 @@ from storage import PREFIX, Publisher, RUN_ID, SafetyStop, encoded
 
 LEADS = list(range(0, 121, 3))
 UTC = timezone.utc
+CYCLE = timedelta(hours=6)
 
 
 def cycle_id(run):
@@ -71,6 +72,26 @@ def reconcile(store, available, latest):
         release_lease(store, lease)
 
 
+def candidate_runs(now, completed, unfinished):
+    target = now.replace(hour=(now.hour // 6) * 6, minute=0, second=0, microsecond=0)
+    if unfinished:
+        run = datetime.strptime(unfinished, '%Y%m%d%H').replace(tzinfo=UTC)
+        yield run
+        if not completed:
+            return
+    elif completed:
+        run = datetime.strptime(completed, '%Y%m%d%H').replace(tzinfo=UTC)
+    else:
+        # 空桶首次启动，从最近四批中选最新的可用起报。
+        for offset in range(4):
+            yield target - offset * CYCLE
+        return
+    run += CYCLE
+    while run <= target:
+        yield run
+        run += CYCLE
+
+
 def select_job(store, model, now, fetch):
     prefix = store.prefix
     available = store.read_json(prefix + 'available.json') or {}
@@ -86,15 +107,8 @@ def select_job(store, model, now, fetch):
         latest = available
     completed = latest.get('run_id', '')[:10]
     active = available.get('run_id', '')[:10]
-    target = now.replace(hour=12 if now.hour >= 12 else 0, minute=0, second=0, microsecond=0)
-    candidates = [target, target - timedelta(hours=12)]
-    if active and not available.get('complete'):
-        resume = datetime.strptime(active, '%Y%m%d%H').replace(tzinfo=UTC)
-        # 首批尚无完整回退时优先续做，避免撤下插件唯一可读的批次。
-        candidates = [resume] if not latest else (candidates + [resume])
-    for run in dict.fromkeys(candidates):
-        if cycle_id(run) <= completed or (active and cycle_id(run) < active):
-            continue
+    unfinished = active if active > completed and not available.get('complete') else None
+    for run in candidate_runs(now, completed, unfinished):
         bundle = fetch(run)
         if bundle:
             attempt = store.read_json(prefix + 'scheduler-attempt.json') or {}

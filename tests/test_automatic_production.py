@@ -33,9 +33,9 @@ class AutomaticProduction(unittest.TestCase):
         def late(run):
             seen.append(prod.cycle_id(run))
         self.assertIsNone(self.plan(late)[1])
-        self.assertEqual(seen,['2026111500','2026111412'])
+        self.assertEqual(seen,['2026111506','2026111500','2026111418','2026111412'])
         self.assertEqual(self.plan(lambda _:self.bundle)[1],self.bundle)
-        self.store.put(self.prefix+'scheduler-attempt.json',encoded({'cycle':'2026111500','retry_after':self.now.timestamp()+60}))
+        self.store.put(self.prefix+'scheduler-attempt.json',encoded({'cycle':'2026111506','retry_after':self.now.timestamp()+60}))
         self.assertIsNone(self.plan(lambda _:self.bundle)[1])
 
     def test_resumes_first_incomplete_even_for_original_18z(self):
@@ -52,7 +52,9 @@ class AutomaticProduction(unittest.TestCase):
         for key,value in [('runs/'+self.run_id+'/manifest.json',manifest),('available.json',avail),('latest.json',manifest),
                           ('runs/2026111412-bbbbbbbbbbbb/F000/old',{}),('outside-runs.json',{})]:
             self.store.put(self.prefix+key,encoded(value))
-        fetch=lambda _:self.fail('已完成起报不应再读源')
+        def fetch(run):
+            self.assertEqual(prod.cycle_id(run),'2026111506')
+            return None
         self.assertIsNone(self.plan(fetch)[1])
         self.assertIsNone(self.store.read_json(self.prefix+'runs/2026111412-bbbbbbbbbbbb/F000/old'))
         self.assertEqual(self.store.read_json(self.prefix+'outside-runs.json'),{})
@@ -72,3 +74,16 @@ class AutomaticProduction(unittest.TestCase):
         self.store.put(self.prefix+'available.json', encoded({'run_id':'2026111418-b72254d378ed','complete':False}))
         self.assertEqual(prod.processor_revision(self.store,'2026111418','a'*40),
                          'b6340d697af566e3ffaf96f595c729c88bb698c7')
+
+    def test_four_cycles_in_order_across_midnight(self):
+        now = datetime(2026, 11, 16, 0, tzinfo=timezone.utc)
+        runs = prod.candidate_runs(now, '2026111418', None)
+        self.assertEqual([prod.cycle_id(run) for run in runs],
+                         ['2026111500','2026111506','2026111512','2026111518','2026111600'])
+
+    def test_oldest_ready_cycle_and_unfinished_cycle_take_priority(self):
+        self.store.put(self.prefix+'latest.json', encoded({'run_id':'2026111418-'+'a'*12}))
+        self.assertIn('2026111500', self.plan(lambda _:self.bundle)[0])
+        self.assertIn('2026111506', self.plan(lambda run:self.bundle if run.hour==6 else None)[0])
+        self.store.put(self.prefix+'available.json', encoded({'run_id':self.run_id,'complete':False}))
+        self.assertIn('2026111500', self.plan(lambda _:self.bundle)[0])
