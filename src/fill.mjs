@@ -36,7 +36,7 @@ export function fillBands(id,values,grid,{sigma=0,onSmoothing,variant}={}){
   const next=cumulative[i+1]?.coordinates;
   const region=next?.length?polygonClipping.difference(band.coordinates,next):band.coordinates;
   if(!region.length)continue;const clipped=polygonClipping.intersection(region,world);if(!clipped.length)continue;
-  features.push({type:'Feature',properties:{value:band.value,color,...(scale?{scaleVersion:2}:{})},geometry:{type:'MultiPolygon',coordinates:clipped.map(p=>p.map(r=>r.map(([x,y])=>[Math.max(-180,Math.min(180,grid.lonMin+(x-1.5)*grid.dx)),Math.max(-limit,Math.min(limit,grid.latMin+(y-.5)*grid.dy))])))}});
+  features.push({type:'Feature',properties:{value:band.value,color,...(scale?{scaleVersion:2}:{}),...(id==='cape'?{capeScaleVersion:2}:{})},geometry:{type:'MultiPolygon',coordinates:clipped.map(p=>p.map(r=>r.map(([x,y])=>[Math.max(-180,Math.min(180,grid.lonMin+(x-1.5)*grid.dx)),Math.max(-limit,Math.min(limit,grid.latMin+(y-.5)*grid.dy))])))}});
  }
  return {type:'FeatureCollection',features};
 }

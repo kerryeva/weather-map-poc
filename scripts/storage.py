@@ -6,7 +6,7 @@ import base64,hashlib,json,os,re,shutil
 PREFIX='ifs-test-v1/'
 RUN_ID=re.compile(r'\d{10}-[a-f0-9]{12}')
 OWNER={'protocol':'open-weather-map-batch-ifs-v1','prefix':PREFIX}
-CEILING_BYTES=8_000_000_000
+CEILING_BYTES=9_000_000_000
 HEADROOM_BYTES=256_000_000
 METADATA_RESERVATION=2_000_000
 BUDGET_WINDOW_DAYS=35

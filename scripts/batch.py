@@ -132,7 +132,7 @@ def prepare_fields(item,spec,current,monitor,session,log_dir):
     return sources,source_fields,extract_seconds,regrid_seconds
 
 def parse_leads(value):
-    if value=='all':return list(range(0,121,3))
+    if value=='all':return list(range(0,97,3))
     try:return [int(s) for s in value.split(',')]
     except ValueError as error:raise argparse.ArgumentTypeError('时次应为 all 或 0,3,6 等整数清单') from error
 
@@ -183,9 +183,9 @@ def main():
     leads=parse_leads(args.leads)
     definition=product_definition(model,args.profile)
     if args.model:
-        if args.mode=='r2' and not ((args.profile=='500hpa' and leads==[0]) or (args.profile=='full' and leads==list(range(0,121,3)))):
+        if args.mode=='r2' and not ((args.profile=='500hpa' and leads==[0]) or (args.profile=='full' and leads==list(range(0,97,3)))):
             parser.error('R2发布支持500hPa/F000首图或完整产品全时次')
-        scope='full' if args.profile=='full' and leads==list(range(0,121,3)) else 'preview'
+        scope='full' if args.profile=='full' and leads==list(range(0,97,3)) else 'preview'
         prefix=f'weather-v1/{model.lower()}/{scope}/'
         if args.metadata:
             bundle=json.loads(args.metadata.read_text())

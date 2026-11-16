@@ -99,3 +99,34 @@ class AutomaticProduction(unittest.TestCase):
         self.assertIn('2026111506', self.plan(lambda run:self.bundle if run.hour==6 else None)[0])
         self.store.put(self.prefix+'available.json', encoded({'run_id':self.run_id,'complete':False}))
         self.assertIn('2026111500', self.plan(lambda _:self.bundle)[0])
+
+
+    def test_four_day_upgrade_removes_obsolete_objects_once(self):
+        Publisher(self.store)
+        old = self.prefix+'runs/'+self.run_id+'/F000/old.pmtiles'
+        self.store.put(old, b'old')
+        self.store.put(self.prefix+'available.json', encoded({'run_id':self.run_id}))
+        self.store.put(self.prefix+'scheduler-attempt.json', encoded({'retry_after':9999999999}))
+        self.store.put(PREFIX+'budgets/rolling-operations.json', encoded({'preserve':True}))
+        prod.upgrade_four_day_policy(self.store)
+        self.assertIsNone(self.store.read_json(self.prefix+'available.json'))
+        self.assertNotIn(old,self.store.list())
+        self.assertEqual(self.store.read_json(PREFIX+'budgets/rolling-operations.json'),{'preserve':True})
+        self.store.put(old,b'new')
+        prod.upgrade_four_day_policy(self.store)
+        self.assertIn(old,self.store.list())
+
+    def test_four_day_upgrade_waits_for_active_writer(self):
+        self.store.put(PREFIX+'writer-lock.json',encoded({'expires':datetime.now(timezone.utc).timestamp()+60}))
+        before=self.store.requests['put']
+        prod.upgrade_four_day_policy(self.store)
+        self.assertEqual(before,self.store.requests['put'])
+
+    def test_four_day_upgrade_rejects_unknown_owned_prefix(self):
+        self.store.put(self.prefix+'owner.json',encoded({'protocol':'someone-else'}))
+        with self.assertRaises(prod.SafetyStop):
+            prod.upgrade_four_day_policy(self.store)
+
+    def test_forecast_policy_has_33_times_and_finishes_at_96(self):
+        self.assertEqual(len(prod.LEADS),33)
+        self.assertEqual(prod.LEADS[-1],96)

@@ -11,7 +11,7 @@ export const STYLES = {
   rh:bands([85,90,95,100], ['#b6dceb','#6bb2d2','#247eac']),
   dew:bands([0,2,4], ['#307fb2','#9ccfe2']),
   rain:bands([.1,1,2.5,5,10,25,50,100], ['#c0e5d5','#8bceaa','#4fad83','#219eac','#357db4','#6655ad','#a43c9b']),
-  cape:bands(Array.from({length:37}, (_,i)=>500+i*100), Array.from({length:36}, (_,i)=>`rgb(${Math.round(211-i*3.8)},${Math.round(184-i*4.2)},${Math.round(232-i*2.4)})`)),
+  cape:bands(Array.from({length:16}, (_,i)=>500+i*100), Array.from({length:16}, (_,i)=>`rgb(${Math.round(211-i*3.8)},${Math.round(184-i*4.2)},${Math.round(232-i*2.4)})`)),
   vort:bands([-40,-20,-12,-8,-4,4,8,12,20,40], ['#187e9c','#339bbb','#69b6ca','#aed6df',null,'#fff0aa','#f4d364','#dfad31','#bb811b']),
   div:dynamicScale('div'),
   vertical:dynamicScale('vertical'),
@@ -37,7 +37,7 @@ export function catalog(profile='full',model='IFS') {
       if (profile==='500hpa' && !(level===500 && id==='height')) continue;
       const suffix=level==='surface'?'2m':`${level}hPa`, wind=level==='surface'?'10m':suffix;
       const inputs={pressure:['pressure_msl'],height:[`geopotential_height_${suffix}`],wind:[`wind_u_component_${wind}`,`wind_v_component_${wind}`],temp:[`temperature_${suffix}`],rh:['relative_humidity_2m'],rain:['precipitation'],cape:['cape'],dew:[`temperature_${suffix}`,`relative_humidity_${suffix}`],vort:[`wind_u_component_${wind}`,`wind_v_component_${wind}`],div:[`wind_u_component_${wind}`,`wind_v_component_${wind}`],vertical:[`vertical_velocity_${suffix}`,`temperature_${suffix}`]}[id];
-      for (const variant of id==='vort'?['absolute','relative']:['default']) {
+      for (const variant of id==='vort'?['relative']:['default']) {
         result.push({key:`${model}-${level}-${id}-${variant}`,level,id,variant,inputs,kind:id==='wind'?'wind':STYLES[id].interval?'line':'fill'});
       }
     }

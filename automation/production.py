@@ -15,7 +15,7 @@ from batch import acquire_lease, model_store, release_lease
 from model_sources import BASE, definition, model_plan, stamp
 from storage import PREFIX, Publisher, RUN_ID, SafetyStop, encoded
 
-LEADS = list(range(0, 121, 3))
+LEADS = list(range(0, 97, 3))
 UTC = timezone.utc
 CYCLE = timedelta(hours=6)
 
@@ -31,7 +31,7 @@ def read_cycle(spec, run, session):
         url = BASE + domain + '/' + run.strftime('%Y/%m/%d/%H%MZ/meta.json')
         response = session.get(url, timeout=(10, 30))
         if response.status_code == 404:
-            # 部分源先公布正在传输的目录，满足 F120 即可，不必等全部远期预报。
+            # 部分源先公布正在传输的目录，满足 F096 即可，不必等全部远期预报。
             response = session.get(BASE + domain + '/in-progress.json', timeout=(10, 30))
             if response.status_code == 404:
                 return None
@@ -72,6 +72,47 @@ def reconcile(store, available, latest):
         release_lease(store, lease)
 
 
+
+def upgrade_four_day_policy(store):
+    """在独占写入租约下完成一次升级，失败后继续清理同一组过时资料。"""
+    receipt = store.prefix + 'four-day-policy.json'
+    policy = {'forecast_hours': 96, 'vorticity': 'relative', 'cape_ceiling': 2000}
+    existing = store.read_json(receipt)
+    if existing == policy:
+        return
+    if existing is not None:
+        raise SafetyStop('四天产品升级记录异常')
+    lock = store.read_json(PREFIX + 'writer-lock.json')
+    if lock and lock['expires'] > datetime.now(UTC).timestamp():
+        return
+    lease = acquire_lease(store)
+    try:
+        owner_key = store.prefix + 'owner.json'
+        owner = {'protocol': 'weather-tiles-v1', 'prefix': store.prefix}
+        recorded = store.read_json(owner_key)
+        objects = store.list()
+        if recorded != owner:
+            if recorded is not None or any(k.startswith(store.prefix) for k in objects):
+                raise SafetyStop('发布前缀归属异常，停止升级清理')
+            store.put(owner_key, encoded(owner))
+        runs_prefix = store.prefix + 'runs/'
+        obsolete = [k for k in objects if k.startswith(runs_prefix)]
+        if any(not RUN_ID.fullmatch(k[len(runs_prefix):].split('/')[0]) for k in obsolete):
+            raise SafetyStop('旧批次名称异常，停止升级清理')
+        pointers = [store.prefix + name for name in
+                    ('available.json', 'latest.json', 'scheduler-attempt.json', 'scheduler-complete.json')]
+        store.delete([k for k in pointers if k in objects])
+        store.delete(obsolete)
+        remaining = store.list()
+        if any(k.startswith(runs_prefix) or k in pointers for k in remaining):
+            raise SafetyStop('过时资料尚未清理完毕')
+        store.put(receipt, encoded(policy))
+        print('Four-day upgrade: removed', len(obsolete), 'obsolete objects,',
+              sum(objects[k]['bytes'] for k in obsolete), 'bytes')
+    finally:
+        release_lease(store, lease)
+
+
 def candidate_runs(now, completed, unfinished):
     target = now.replace(hour=(now.hour // 6) * 6, minute=0, second=0, microsecond=0)
     if unfinished:
@@ -101,7 +142,7 @@ def select_job(store, model, now, fetch, queue_limit=DEFAULT_QUEUE_LIMIT):
     available = store.read_json(prefix + 'available.json') or {}
     lock = store.read_json(PREFIX + 'writer-lock.json')
     if lock and lock['expires'] > now.timestamp():
-        return f"writer active: {available.get('run_id', 'starting')}, {len(available.get('times', []))}/41; next check in 30 min", None
+        return f"writer active: {available.get('run_id', 'starting')}, {len(available.get('times', []))}/{len(LEADS)}; next check in 30 min", None
     latest = store.read_json(prefix + 'latest.json') or {}
     for item in (available, latest):
         if item and not RUN_ID.fullmatch(item.get('run_id', '')):
@@ -168,6 +209,7 @@ def main():
         delay = min(6, previous.get('hours', 0) * 2 or 1) if previous.get('cycle') == cycle_id(run) else 1
         store.put(attempt_key, encoded({'cycle':cycle_id(run),'processor_commit':os.environ['PROCESSOR_COMMIT'],'hours':delay,'queue_limit':queue_limit,'retry_after':now.timestamp()+delay*3600}))
         return
+    upgrade_four_day_policy(store)
     spec = definition(model, 'full')
     with requests.Session() as session:
         message, bundle = select_job(store, model, now, lambda run: read_cycle(spec, run, session), queue_limit)

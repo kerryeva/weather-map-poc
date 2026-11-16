@@ -3,12 +3,12 @@ import assert from 'node:assert/strict';
 import {catalog,fieldSources} from '../src/catalog.mjs';
 import {regrid,GFS013_GRID} from '../src/regrid.mjs';
 
-test('双模式54产品与43字段，GFS地面5变量单独路由',()=>{
+test('双模式48产品与43字段，GFS地面5变量单独路由',()=>{
   for(const model of ['IFS','GFS']) {
     const products=catalog('full',model),fields=fieldSources('full',model);
-    assert.equal(products.length,54);assert.equal(fields.length,43);
+    assert.equal(products.length,48);assert.equal(fields.length,43);
     assert.ok(products.every(p=>p.key.startsWith(model+'-')));
-    assert.equal(new Set(products.map(p=>p.key)).size,54);
+    assert.equal(new Set(products.map(p=>p.key)).size,48);
     assert.deepEqual(catalog('500hpa',model).map(p=>p.key),[model+'-500-height-default']);
     if(model==='GFS') {
       assert.deepEqual(fields.filter(f=>f.domain==='ncep_gfs013').map(f=>f.variable).sort(),
