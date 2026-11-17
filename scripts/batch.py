@@ -99,6 +99,12 @@ class DiskMonitor:
             'min_free_bytes':self.min_free,'max_work_bytes':self.max_work,
             'note':'工作目录为抽样峰值；不包含目录外依赖、操作系统和其他进程占用。磁盘剩余量包含同一文件系统所有占用。'}
 
+def log_tail(log,lines=12,width=240):
+    """失败时把子进程日志的末尾带回标准输出：否则云端只看到「退出码 1」，无从判断原因。"""
+    try: rows=log.read_text(errors='replace').splitlines()[-lines:]
+    except OSError: return []
+    return [row[:width] for row in rows]
+
 def execute(command,monitor,log,timeout=1200,label='处理阶段'):
     start=time.monotonic()
     with log.open('w') as stream:
@@ -115,6 +121,7 @@ def execute(command,monitor,log,timeout=1200,label='处理阶段'):
                 # 并行处理器失败时，清理同一进程组里的孙进程，不能留下几何任务继续占用CPU。
                 try:os.killpg(child.pid,signal.SIGTERM)
                 except ProcessLookupError:pass
+                for row in log_tail(log):print('  | '+row,flush=True)
                 raise StageFailure(f'{label}退出码 {child.returncode}')
         finally:
             if child.poll() is None:

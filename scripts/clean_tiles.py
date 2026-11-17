@@ -16,24 +16,28 @@ def polygons(geometry):
  if hasattr(geometry,'geoms'):return [p for g in geometry.geoms for p in polygons(g)]
  return []
 
-def decode_rings(rings,counts=None):
+def decode_rings(rings,counts=None,tolerate_orphan_holes=False):
  parts=[];current=[]
  for r in rings:
   if len(r)<4 or area(r)==0:
+   # 量化后坍缩成线的外环会被丢掉，它带着的孔洞就失去了外环；这类残环不能猜连接，直接丢弃更安全。
    if counts is not None:counts['degenerate_rings_removed']+=1
    continue
   if area(r)>0:
    if current:parts.append(Polygon(current[0],current[1:]))
    current=[r]
   else:
-   if not current:raise ValueError('MVT 孔洞缺少外环，不能猜测连接')
+   if not current:
+    if not tolerate_orphan_holes:raise ValueError('MVT 孔洞缺少外环，不能猜测连接')
+    if counts is not None:counts['orphan_holes_removed']=counts.get('orphan_holes_removed',0)+1
+    continue
    current.append(r)
  if current:parts.append(Polygon(current[0],current[1:]))
  return MultiPolygon(parts) if len(parts)>1 else parts[0] if parts else GeometryCollection()
 
 def clean_feature(feature):
- counts={'degenerate_rings_removed':0}
- before=decode_rings(feature['geometry'],counts);was_valid=before.is_valid
+ counts={'degenerate_rings_removed':0,'orphan_holes_removed':0}
+ before=decode_rings(feature['geometry'],counts,tolerate_orphan_holes=True);was_valid=before.is_valid
  # geojson-vt 已给定内外环。结构法合并相交外环、扣除孔洞；
  # linework 的奇偶规则会把重复缓冲区域当洞，造成大片漏填。
  fixed=make_valid(before,method='structure',keep_collapsed=False) if not was_valid else before
@@ -61,7 +65,7 @@ def clean_lines(feature):
 
 def exclusive_bands(features):
  # 用实际将编码的坐标检查重叠；这里不能再次吸附后检查另一份几何。
- indexed=[(i,f,decode_rings(f['geometry'])) for i,f in enumerate(features) if f['type']==3]
+ indexed=[(i,f,decode_rings(f['geometry'],tolerate_orphan_holes=True)) for i,f in enumerate(features) if f['type']==3]
  if len(indexed)<2:return features,0
  combined=union_all([g for _,_,g in indexed],grid_size=0)
  overlap=max(0,sum(g.area for _,_,g in indexed)-combined.area)
@@ -91,7 +95,7 @@ def exclusive_bands(features):
 
 def main():
  start=time.process_time()
- source=Path(sys.argv[1]);dest=Path(sys.argv[2]);report={'method':'structure_precision_1_shared_noded_boundaries_nonzero_lines','features':0,'invalid_before':0,'invalid_after':0,'absolute_area_change':0,'collapsed_to_empty':0,'collapsed_line_parts':0,'degenerate_rings_removed':0,'overlap_tiles_fixed':0,'overlap_area_before_partition':0,'area_note':'无效输入的 area 是代数值，变化量不能直接解释为实际面积损失；需源填色/瓦片独立抽样比较'}
+ source=Path(sys.argv[1]);dest=Path(sys.argv[2]);report={'method':'structure_precision_1_shared_noded_boundaries_nonzero_lines','features':0,'invalid_before':0,'invalid_after':0,'absolute_area_change':0,'collapsed_to_empty':0,'collapsed_line_parts':0,'degenerate_rings_removed':0,'orphan_holes_removed':0,'overlap_tiles_fixed':0,'overlap_area_before_partition':0,'area_note':'无效输入的 area 是代数值，变化量不能直接解释为实际面积损失；需源填色/瓦片独立抽样比较'}
  with source.open() as fi,dest.open('w') as fo:
   for line in fi:
    tile=json.loads(line);features=[]
@@ -102,7 +106,7 @@ def main():
      continue
     if feature['type']!=3:features.append(feature);continue
     cleaned,metric=clean_feature(feature);report['features']+=1
-    for key in ('invalid_before','absolute_area_change','collapsed_to_empty','degenerate_rings_removed'):report[key]+=metric[key]
+    for key in ('invalid_before','absolute_area_change','collapsed_to_empty','degenerate_rings_removed','orphan_holes_removed'):report[key]+=metric[key]
     if cleaned['geometry']:features.append(cleaned)
    features,overlap=exclusive_bands(features);report['overlap_tiles_fixed']+=int(overlap>0);report['overlap_area_before_partition']+=overlap
    tile['features']=features;fo.write(json.dumps(tile,separators=(',',':'))+'\n')
