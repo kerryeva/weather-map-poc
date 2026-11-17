@@ -149,6 +149,26 @@ def execute_stage(command,monitor,log,budget,label,reset=None,deadline=None):
             if reset is not None:reset()
             monitor.sample();monitor.check()
 
+def retry_skipped(failures,plan,run_one,started,keep_going=None,now=time.monotonic,limit=5*3600,reserve=600,log=print):
+    """整批跑完后，对跳过的时次再试一次；时间预算见底或租约易主就不再尝试。
+
+    run_one(item) 返回 None 表示成功、返回原因字符串表示仍失败。list 原地更新：
+    重试成功的从 failures 移除，仍失败的把原因刷新为最新一次。返回恢复的时次列表。"""
+    recovered=[]
+    for row in list(failures):
+        if now()-started>limit-reserve:break
+        if keep_going is not None and not keep_going():break
+        item=next((x for x in plan if x['lead']==row['lead']),None)
+        if item is None:continue
+        log(json.dumps({'lead':row['lead'],'status':'retry'},ensure_ascii=False),flush=True)
+        reason=run_one(item)
+        if reason is None:
+            failures.remove(row);recovered.append(row['lead'])
+            log(json.dumps({'lead':row['lead'],'status':'recovered'},ensure_ascii=False),flush=True)
+        else:
+            row['reason']=reason
+    return recovered
+
 def _download_once(url,path,monitor,session):
     start=time.monotonic();part=path.with_suffix('.part')
     with session.get(url,stream=True,timeout=(15,90)) as response:
@@ -341,15 +361,14 @@ def main():
                     step_summary(['### 批次准备完成','',f"- 模式：{model}｜起报：{report['run']}",f"- run_id：{run_id}",f"- 时次：{len(plan)}"])
                     print(json.dumps({'status':'prepared','run_id':run_id,'leads':len(plan),'run':report['run']}));return
             report['status']='running';failures=[];report['failures']=failures;save()
-            for item in plan:
-                if time.monotonic()-started>5*3600:raise SafetyStop('整批任务接近时间上限')
-                if heartbeat is not None and heartbeat.lost:raise SafetyStop('写入租约已被其他任务接管，本进程停止上传')
+            def process(item):
+                """处理单个时次：成功写入 report['times'] 并返回 None，失败返回原因字符串。"""
                 lead=item['lead'];time_key=prefix+f'runs/{run_id}/F{lead:03}/';manifest_key=time_key+'manifest.json'
                 if publisher:
                     existing=publisher.store.read_json(manifest_key)
                     if existing and valid_time_manifest(existing,definition,lead,fingerprint) and all(publisher.matches(r['object_key'],r['bytes'],r['md5']) for r in existing['products'] if r['status']=='verified'):
                         publisher.publish_time(existing)
-                        report['times'].append({**existing,'resumed':True});save();continue
+                        report['times'].append({**existing,'resumed':True});save();return None
                 # 前次失败遗留也只清理本程序标记下的当前时次，不删除任何源项目文件。
                 current=work/'current'
                 if current.exists():shutil.rmtree(current)
@@ -405,13 +424,25 @@ def main():
                     one['timings']['time_total_seconds']=time.monotonic()-time_start;save()
                     print(json.dumps({'lead':lead,'status':'verified','products':len(files),'bytes':one['product_bytes'],'work_bytes_after_cleanup':directory_bytes(work)}),flush=True)
                 except (StageTimeout,StageFailure) as error:
-                    # 单个时次两次都没成：跳过它继续，绝不把整批和已完成的时次一起丢掉。
-                    failures.append({'lead':lead,'reason':str(error)})
-                    if len(failures)>MAX_SKIPS:raise SafetyStop(f'连续时次失败过多（{len(failures)} 个），停止本片')
-                    report['failures']=failures;report['current_lead']=None;save()
-                    print(json.dumps({'lead':lead,'status':'skipped','reason':str(error)},ensure_ascii=False),flush=True)
+                    # 单个时次两次都没成：先记下来，整批跑完再统一重试一次，绝不拖死整片。
+                    report['current_lead']=None;save()
                     shutil.rmtree(current,ignore_errors=True)
-                    continue
+                    return str(error)
+                return None
+            for item in plan:
+                if time.monotonic()-started>5*3600:raise SafetyStop('整批任务接近时间上限')
+                if heartbeat is not None and heartbeat.lost:raise SafetyStop('写入租约已被其他任务接管，本进程停止上传')
+                reason=process(item)
+                if reason is None:continue
+                failures.append({'lead':item['lead'],'reason':reason});report['failures']=failures;save()
+                if len(failures)>MAX_SKIPS:raise SafetyStop(f'连续时次失败过多（{len(failures)} 个），停止本片')
+                print(json.dumps({'lead':item['lead'],'status':'skipped','reason':reason},ensure_ascii=False),flush=True)
+            if failures:
+                # 收尾重试：同一进程内再跑一遍失败的时次，通常网络与内存已恢复；预算见底就不试。
+                recovered=retry_skipped(failures,plan,process,started,
+                    keep_going=(lambda: not heartbeat.lost) if heartbeat is not None else None)
+                if recovered:report['times'].sort(key=lambda t:t['lead'])
+                report['failures']=failures;save()
             if len(report['times'])+len(failures)!=len(plan):raise ValueError('整批时次未全部完成')
             complete=not failures
             if not complete:
