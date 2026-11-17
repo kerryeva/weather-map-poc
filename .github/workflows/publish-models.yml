@@ -91,6 +91,8 @@ jobs:
               IFS) export TARGET_BUCKET="$IFS_BUCKET" TARGET_KEY="$IFS_KEY" TARGET_SECRET="$IFS_SECRET" ;;
               GFS) export TARGET_BUCKET="$GFS_BUCKET" TARGET_KEY="$GFS_KEY" TARGET_SECRET="$GFS_SECRET" ;;
             esac
+            # begin 只认固定的 scheduled-metadata.json，按模式换回它要的那一份。
+            cp "$metadata" "$RUNNER_TEMP/scheduled-metadata.json"
             python automation/production.py begin
             python scripts/batch.py --metadata "$metadata" --model "$MODEL" --profile full --leads all --mode r2 \
               --shard 0/4 --prepare-only --product-workers 4 --work "$RUNNER_TEMP/work" --report "$RUNNER_TEMP/report/run.json"
