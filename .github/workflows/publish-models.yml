@@ -88,9 +88,12 @@ jobs:
             model="$1"; metadata="$2"; processor="$3"
             export MODEL="$model" PROCESSOR_COMMIT="$processor"
             case "$model" in
-              IFS) export TARGET_BUCKET="$IFS_BUCKET" TARGET_KEY="$IFS_KEY" TARGET_SECRET="$IFS_SECRET" ;;
-              GFS) export TARGET_BUCKET="$GFS_BUCKET" TARGET_KEY="$GFS_KEY" TARGET_SECRET="$GFS_SECRET" ;;
+              IFS) bucket="$IFS_BUCKET"; key="$IFS_KEY"; secret="$IFS_SECRET" ;;
+              GFS) bucket="$GFS_BUCKET"; key="$GFS_KEY"; secret="$GFS_SECRET" ;;
             esac
+            # production.py 认 TARGET_*，batch.py 认 <MODEL>_R2_*，两边都要给。
+            export TARGET_BUCKET="$bucket" TARGET_KEY="$key" TARGET_SECRET="$secret"
+            export "${model}_R2_BUCKET=$bucket" "${model}_R2_ACCESS_KEY_ID=$key" "${model}_R2_SECRET_ACCESS_KEY=$secret"
             # begin 只认固定的 scheduled-metadata.json，按模式换回它要的那一份。
             cp "$metadata" "$RUNNER_TEMP/scheduled-metadata.json"
             python automation/production.py begin
