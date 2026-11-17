@@ -3,12 +3,37 @@ from pathlib import Path
 from datetime import datetime,timezone
 import argparse,hashlib,json,os,re,shutil,signal,subprocess,sys,threading,time
 import requests
-from storage import PREFIX,Publisher,LocalStore,R2Store,SafetyStop,encoded,digests
+from storage import PREFIX,Publisher,LocalStore,R2Store,SafetyStop,encoded,digests,shard_budget,retained_bytes
 
 ROOT=Path(__file__).resolve().parents[1]
 from model_sources import BASE as SPATIAL,definition as product_definition,discover,model_plan,build_plan
 SOURCE=SPATIAL+'ecmwf_ifs025/'
 UTC=timezone.utc
+FULL_LEADS=list(range(0,97,3))
+STOP_DETAIL={}
+
+def shard_leads(index,count):
+    """把完整时次表切成等长的连续分片，最后一片可能更短。"""
+    if not 1<=count<=16 or not 0<=index<count:raise SafetyStop('分片参数只允许序号小于总数且总数不超过16')
+    chunk=-(-len(FULL_LEADS)//count)
+    return FULL_LEADS[index*chunk:(index+1)*chunk]
+
+def public_error(error,mode):
+    """公开日志只保留可安全展示的原因：SafetyStop 的中文说明，或异常类型加 SDK 错误码。"""
+    code=getattr(error,'response',{}).get('Error',{}).get('Code','')
+    safe_code=code if isinstance(code,str) and re.fullmatch('[A-Za-z0-9_.-]{1,60}',code) else ''
+    if isinstance(error,SafetyStop) or mode!='r2':return str(error)
+    return type(error).__name__+(':'+safe_code if safe_code else '')
+
+def step_summary(lines):
+    """关键结论写入 GitHub job summary；本地运行没有该环境变量时静默跳过。"""
+    path=os.environ.get('GITHUB_STEP_SUMMARY')
+    if not path:return
+    try:
+        with open(path,'a',encoding='utf-8') as stream:stream.write('\n'.join(lines)+'\n')
+    except OSError:
+        # 摘要写不进去不影响生产，只失去可读性。
+        pass
 
 def directory_bytes(root):
     total=0
@@ -162,9 +187,21 @@ def main():
     parser.add_argument('--maxzoom',type=int,default=5)
     parser.add_argument('--product-workers',type=int,default=1)
     parser.add_argument('--plan-only',action='store_true')
+    parser.add_argument('--shard',default=None,help='分片序号/总数，例如 2/4')
+    parser.add_argument('--byte-budget',type=int,default=None,help='本进程允许写入的字节上限')
+    parser.add_argument('--skip-prepare',action='store_true',help='不清理旧批次，仅追加本分片时次')
+    parser.add_argument('--prepare-only',action='store_true',help='只准备批次（取租约、清旧批、写进度）后退出')
     args=parser.parse_args()
     if not 0<=args.maxzoom<=5:parser.error('缩放层级只允许0至5')
     if not 1<=args.product_workers<=4:parser.error('产品并行数只允许1至4')
+    shard=None
+    if args.shard:
+        try:index_text,count_text=args.shard.split('/');shard=(int(index_text),int(count_text))
+        except ValueError:parser.error('分片参数格式为 序号/总数')
+        try:expected=shard_leads(*shard)
+        except SafetyStop as error:parser.error(str(error))
+        if not expected:parser.error('该分片没有时次')
+    if args.byte_budget is not None and args.byte_budget<=0:parser.error('字节预算必须为正数')
     work=args.work.resolve();report_path=args.report.resolve()
     if report_path.is_relative_to(work):parser.error('报告必须放在清理目录之外')
     if args.mode=='local' and not args.output:parser.error('local 模式需要 --output')
@@ -181,11 +218,14 @@ def main():
     model=args.model or 'IFS'
     prefix=PREFIX
     leads=parse_leads(args.leads)
+    if shard and args.leads=='all':leads=expected
     definition=product_definition(model,args.profile)
     if args.model:
-        if args.mode=='r2' and not ((args.profile=='500hpa' and leads==[0]) or (args.profile=='full' and leads==list(range(0,97,3)))):
-            parser.error('R2发布支持500hPa/F000首图或完整产品全时次')
-        scope='full' if args.profile=='full' and leads==list(range(0,97,3)) else 'preview'
+        complete=args.profile=='full' and leads==FULL_LEADS
+        partial=bool(shard) and args.profile=='full' and leads==expected
+        if args.mode=='r2' and not ((args.profile=='500hpa' and leads==[0]) or complete or partial):
+            parser.error('R2发布支持500hPa/F000首图、完整产品全时次或单个分片')
+        scope='full' if complete or partial else 'preview'
         prefix=f'weather-v1/{model.lower()}/{scope}/'
         if args.metadata:
             bundle=json.loads(args.metadata.read_text())
@@ -200,7 +240,8 @@ def main():
         run,plan=build_plan(meta,leads)
         for item in plan:
             item['sources']=[{'domain':'ecmwf_ifs025','url':item['url']}]
-    processing={'model':model,'profile':args.profile,'maxzoom':args.maxzoom,'leads':[x['lead'] for x in plan],
+    # 分片共用同一个起报与指纹，否则 4 个分片会各算出一个 run_id。
+    processing={'model':model,'profile':args.profile,'maxzoom':args.maxzoom,'leads':FULL_LEADS if shard else [x['lead'] for x in plan],
         'products':definition['products'],'line_sigma':2,'rain_trace_kernel':[1,4,6,4,1],'rain_display_subdivision':2,'cape_sigma':.5,'other_fill_sigma':2,
         'version':'weather-tiles-v1' if args.model else 'ifs-batch-v1','source_code_sha256':source_fingerprint()}
     processing['product_workers']=args.product_workers
@@ -214,7 +255,7 @@ def main():
     save()
     if args.plan_only:
         print(json.dumps({'status':'planned','run':report['run'],'times':len(plan),'products':len(definition['products']),'fields':len(definition['fields'])}));return
-    monitor=DiskMonitor(work);publisher=None;lease=None;started=time.monotonic()
+    monitor=DiskMonitor(work);publisher=None;lease=None;heartbeat=None;started=time.monotonic()
     try:
         with monitor:
             if args.mode!='discard':
@@ -225,7 +266,16 @@ def main():
                 else:
                     store=R2Store(args.bucket)
                 lease=acquire_lease(store)
+                if not isinstance(lease,LocalStore):
+                    heartbeat=LeaseHeartbeat(store,lease).start()
+                    # 取消时先走 finally 释放租约，而不是留下长时间的空锁。
+                    def _terminate(signum,frame):
+                        raise SafetyStop('收到终止信号，提前收尾')
+                    signal.signal(signal.SIGTERM,_terminate)
                 publisher=Publisher(store)
+                # 分片模式下每个进程只按自己的额度写入，总和由 shard_budget 保证不越红线。
+                if args.byte_budget is not None:publisher.budget=args.byte_budget
+                elif shard:publisher.budget=shard_budget(shard[1],retained_bytes(publisher,run_id))
                 active=(publisher.available or {}).get('run_id','')
                 if active[:10]>run_id[:10]:
                     raise SafetyStop('已有更新起报正在发布')
@@ -236,11 +286,22 @@ def main():
                 max_pages=max(1,(max_objects+999)//1000)
                 reserved_a=2*(len(definition['products'])*len(plan)+len(plan)*2+30+(len(plan)+4)*max_pages)
                 publisher.reserve_operations(datetime.now(UTC).date().isoformat(),reserved_a)
-                publisher.prepare(run_id)
-                publisher.put_json(prefix+f'runs/{run_id}/progress.json',{'run':report['run'],'processing_sha256':fingerprint,'processor_commit':os.environ.get('PROCESSOR_COMMIT'),'status':'incomplete'})
+                if args.skip_prepare:
+                    # 旧批次只由 0 号分片清理；其余分片先等它写出准备标记，绝不删除他人成果。
+                    wait_for_prepare(publisher.store,prefix,run_id)
+                    publisher.target=run_id
+                else:
+                    publisher.prepare(run_id)
+                progress=prefix+f'runs/{run_id}/progress.json' if not shard else prefix+f'runs/{run_id}/progress-p{shard[0]}.json'
+                publisher.put_json(progress,{'run':report['run'],'processing_sha256':fingerprint,'processor_commit':os.environ.get('PROCESSOR_COMMIT'),'status':'incomplete',
+                    'shard':args.shard,'leads':[x['lead'] for x in plan]})
+                if args.prepare_only:
+                    step_summary(['### 批次准备完成','',f"- 模式：{model}｜起报：{report['run']}",f"- run_id：{run_id}",f"- 时次：{len(plan)}"])
+                    print(json.dumps({'status':'prepared','run_id':run_id,'leads':len(plan),'run':report['run']}));return
             report['status']='running';save()
             for item in plan:
                 if time.monotonic()-started>5*3600:raise SafetyStop('整批任务接近时间上限')
+                if heartbeat is not None and heartbeat.lost:raise SafetyStop('写入租约已被其他任务接管，本进程停止上传')
                 lead=item['lead'];time_key=prefix+f'runs/{run_id}/F{lead:03}/';manifest_key=time_key+'manifest.json'
                 if publisher:
                     existing=publisher.store.read_json(manifest_key)
@@ -301,23 +362,36 @@ def main():
                 print(json.dumps({'lead':lead,'status':'verified','products':len(files),'bytes':one['product_bytes'],'work_bytes_after_cleanup':directory_bytes(work)}),flush=True)
             if len(report['times'])!=len(plan):raise ValueError('整批时次未全部完成')
             if publisher:
-                manifest={'run_id':run_id,'run':report['run'],'processing_sha256':fingerprint,'status':'complete',
-                    'profile':args.profile,'times':[{'lead':t['lead'],'valid':t['valid'],'product_bytes':t['product_bytes']} for t in report['times']],
-                    'product_bytes':sum(t['product_bytes'] for t in report['times']),'model':model,'attribution':f"Open-Meteo / {'ECMWF' if model=='IFS' else 'NOAA'}, CC BY 4.0"}
-                publisher.finish_run(manifest,[t['lead'] for t in plan])
+                times=list(report['times']);expected=[t['lead'] for t in plan]
+                if shard:
+                    covered={row['lead'] for row in publisher.available['times']}
+                    if covered!=set(FULL_LEADS):
+                        # 其他分片还没写完，本轮先不写完整批次索引，等最后一片收尾。
+                        print(json.dumps({'shard':args.shard,'status':'waiting_other_shards','covered':len(covered),'total':len(FULL_LEADS)}),flush=True)
+                        times=None;expected=FULL_LEADS
+                    else:
+                        times=[{'lead':row['lead'],'valid':row['valid'],'product_bytes':row['product_bytes']} for row in publisher.available['times']]
+                        expected=FULL_LEADS
+                if times:
+                    manifest={'run_id':run_id,'run':report['run'],'processing_sha256':fingerprint,'status':'complete',
+                        'profile':args.profile,'times':[{'lead':t['lead'],'valid':t['valid'],'product_bytes':t['product_bytes']} for t in times],
+                        'product_bytes':sum(t['product_bytes'] for t in times),'model':model,'attribution':f"Open-Meteo / {'ECMWF' if model=='IFS' else 'NOAA'}, CC BY 4.0"}
+                    publisher.finish_run(manifest,expected)
                 report['store']={'observed_peak_bytes':publisher.peak_bytes,'final_tracked_bytes':publisher.current_bytes,
                     'batch_count':len(publisher.batches),'application_requests':publisher.store.requests,
                     'note':'SDK 自动重试次数不在 application_requests 中；A 类预算按每次调用最多两次尝试预留。'}
             report['status']='complete'
+            step_summary(['### 制图完成','',f"- 模式：{model}｜起报：{report['run']}",f"- 时次：{len(report['times'])}｜成品字节：{sum(t['product_bytes'] for t in report['times'])}"])
     except Exception as error:
         report['status']='safety_stop' if isinstance(error,SafetyStop) else 'failed'
         # SDK 错误可能包含账户信息；公开日志只保留错误类型，详细错误不打印凭据。
-        code=getattr(error,'response',{}).get('Error',{}).get('Code','')
-        safe_code=code if re.fullmatch('[A-Za-z0-9_.-]{1,60}',code) else ''
-        report['error']=str(error) if not args.mode=='r2' or isinstance(error,SafetyStop) else type(error).__name__+(':'+safe_code if safe_code else '')
+        detail=public_error(error,args.mode);STOP_DETAIL['detail']=detail
+        report['error']=detail
+        step_summary(['### 制图停止','',f"- 原因：{detail}",f"- 状态：{report['status']}",f"- 已完成时次：{len(report.get('times',[]))}"])
         raise
     finally:
         release_error=None
+        if heartbeat is not None:heartbeat.stop()
         if lease is not None:
             try:release_lease(store,lease)
             except Exception as error:
@@ -340,10 +414,41 @@ def source_fingerprint():
             if path.suffix in extensions:digest.update(path.name.encode()+b'\0'+path.read_bytes())
     return digest.hexdigest()
 
+def wait_for_prepare(store,prefix,run_id,timeout=900,interval=15):
+    """非 0 号分片等到 0 号分片写好准备标记再上传；超时即停止，绝不自作主张清理旧批。"""
+    key=prefix+f'runs/{run_id}/progress-p0.json'
+    deadline=time.monotonic()+timeout
+    while store.read_json(key) is None:
+        if time.monotonic()>deadline:raise SafetyStop('批次准备未完成，分片拒绝开始上传')
+        time.sleep(interval)
+    return key
+
+LEASE_SECONDS=1800
+LEASE_RENEW_SECONDS=600
+
+class LeaseHeartbeat:
+    """把租约改成短 TTL + 心跳：进程被取消后最多 LEASE_SECONDS 就自动失效，不会再空锁七小时。"""
+    def __init__(self,store,token,prefix=PREFIX,seconds=LEASE_SECONDS,renew=LEASE_RENEW_SECONDS):
+        self.store=store;self.token=token;self.prefix=prefix;self.seconds=seconds;self.renew=renew
+        self.lost=False;self.beats=0;self._stop=threading.Event();self._thread=None
+    def beat(self):
+        lock=self.store.read_json(self.prefix+'writer-lock.json')
+        if not lock or lock.get('token')!=self.token:
+            self.lost=True;return False
+        self.store.put(self.prefix+'writer-lock.json',encoded({'token':self.token,'expires':time.time()+self.seconds}))
+        self.beats+=1;return True
+    def _loop(self):
+        while not self._stop.wait(self.renew):
+            if not self.beat():return
+    def start(self):
+        self._thread=threading.Thread(target=self._loop,daemon=True,name='lease-heartbeat');self._thread.start();return self
+    def stop(self):
+        self._stop.set()
+
 def acquire_lease(store):
-    """七小时排他租约；任务本身最多五小时，异常退出时不与下一任务竞争。"""
+    """排他租约：TTL 由心跳续期（默认 30 分钟，每 10 分钟一次），进程被取消也不会长时间占锁。"""
     import uuid
-    token=uuid.uuid4().hex;payload={'token':token,'expires':time.time()+7*3600}
+    token=uuid.uuid4().hex;payload={'token':token,'expires':time.time()+LEASE_SECONDS}
     key=PREFIX+'writer-lock.json'
     if isinstance(store,LocalStore):
         import fcntl
@@ -379,4 +484,5 @@ if __name__=='__main__':
     try:main()
     except Exception as error:
         # 详细公开错误已由报告脱敏；不把 SDK 响应和环境变量直接输出。
-        print(f'任务停止：{type(error).__name__}',file=sys.stderr);sys.exit(2)
+        detail=STOP_DETAIL.get('detail','')
+        print(f'任务停止：{type(error).__name__}'+(f'：{detail}' if detail else ''),file=sys.stderr);sys.exit(2)

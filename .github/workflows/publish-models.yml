@@ -20,14 +20,18 @@ jobs:
       fail-fast: false
       matrix:
         model: [IFS, GFS]
+        shard: ['0/4', '1/4', '2/4', '3/4']
+    # 手动触发仍按单任务跑全量；自动触发才拆成四片（每模型 4 个 job），每片各有独立并发组。
+    if: ${{ (inputs.scope || 'auto') != 'auto' && matrix.shard == '0/4' || (inputs.scope || 'auto') == 'auto' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 330
     env:
       POLYGON_CLIPPING_MAX_QUEUE_SIZE: '2000000'
       MODEL: ${{ matrix.model }}
+      SHARD: ${{ matrix.shard }}
       SCOPE: ${{ inputs.scope || 'auto' }}
     concurrency:
-      group: auto-weather-${{ matrix.model }}
+      group: auto-weather-${{ matrix.model }}-${{ replace(matrix.shard, '/', '-') }}
       cancel-in-progress: false
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
@@ -78,14 +82,16 @@ jobs:
         shell: bash
         run: |
           export "${MODEL}_R2_BUCKET=$TARGET_BUCKET" "${MODEL}_R2_ACCESS_KEY_ID=$TARGET_KEY" "${MODEL}_R2_SECRET_ACCESS_KEY=$TARGET_SECRET"
-          metadata=()
+          metadata=(); shard=()
           case "$SCOPE" in
             auto)
-              python automation/production.py begin
+              # 只有 0 号分片登记调度尝试并清理旧批次，其余分片等它写好准备标记再上传。
+              if [ "${SHARD%%/*}" = '0' ]; then python automation/production.py begin; else shard=(--skip-prepare); fi
+              shard+=(--shard "$SHARD")
               profile=full; leads=all; metadata=(--metadata "$RUNNER_TEMP/scheduled-metadata.json") ;;
             height) profile=500hpa; leads=0 ;;
             full) profile=full; leads=all ;;
             *) exit 2 ;;
           esac
-          python scripts/batch.py "${metadata[@]}" --model "$MODEL" --profile "$profile" --leads "$leads" --mode r2 \
+          python scripts/batch.py "${metadata[@]}" "${shard[@]}" --model "$MODEL" --profile "$profile" --leads "$leads" --mode r2 \
             --product-workers 4 --work "$RUNNER_TEMP/work" --report "$RUNNER_TEMP/report/run.json"

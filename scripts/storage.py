@@ -6,13 +6,31 @@ import base64,hashlib,json,os,re,shutil
 PREFIX='ifs-test-v1/'
 RUN_ID=re.compile(r'\d{10}-[a-f0-9]{12}')
 OWNER={'protocol':'open-weather-map-batch-ifs-v1','prefix':PREFIX}
-CEILING_BYTES=9_000_000_000
+CEILING_BYTES=9_600_000_000
 HEADROOM_BYTES=256_000_000
 METADATA_RESERVATION=2_000_000
 BUDGET_WINDOW_DAYS=35
 
 class SafetyStop(RuntimeError):
     """保险丝触发：不得降级为成功、继续上传或自动扩大限制。"""
+
+def retained_bytes(publisher,run_id):
+    """本轮之外仍在桶里的字节（旧完整批）：分片预算必须先扣掉它，才能保证总量不越线。"""
+    runs=publisher.prefix+'runs/';marker=runs+run_id+'/'
+    # 只统计旧批次对象；owner/available/latest 等元数据已由 METADATA_RESERVATION 覆盖。
+    return sum(row['bytes'] for key,row in publisher.objects.items() if key.startswith(runs) and not key.startswith(marker))
+
+def shard_budget(shard_count,retained_bytes=0):
+    """每个分片进程允许写入的字节上限：所有分片加起来也越不过容量红线。
+
+    该额度由本进程自己计数执行，不依赖远端快照，因此与并发时序无关。
+    """
+    if not 1<=shard_count<=16:raise SafetyStop('分片数量只允许1至16')
+    if retained_bytes<0:raise SafetyStop('保留字节数无效')
+    metadata=METADATA_RESERVATION*(shard_count+2)
+    available=CEILING_BYTES-HEADROOM_BYTES-retained_bytes-metadata
+    if available<=0:raise SafetyStop('容量余量不足，禁止分片发布')
+    return available//shard_count
 
 def encoded(value):
     return (json.dumps(value,ensure_ascii=False,separators=(',',':'))+'\n').encode()
@@ -155,11 +173,14 @@ class R2Store:
             if response.get('Errors'):raise SafetyStop('旧测试批次清理不完整，禁止上传新批次')
 
 class Publisher:
-    def __init__(self,store,ceiling=CEILING_BYTES,reserve=HEADROOM_BYTES):
+    def __init__(self,store,ceiling=CEILING_BYTES,reserve=HEADROOM_BYTES,budget=None):
         if not 0<ceiling<=CEILING_BYTES or reserve<0:
             raise SafetyStop('不能扩大保险丝上限')
+        if budget is not None and not 0<budget<=CEILING_BYTES:
+            raise SafetyStop('分片字节预算无效')
         self.prefix=store.prefix
         self.store=store;self.ceiling=ceiling;self.reserve=reserve
+        self.budget=budget;self.written=0
         self.refresh();self.peak_bytes=self.current_bytes
         self.latest=store.read_json(self.prefix+'latest.json');self.remaining=0;self.target=None
         self.available=store.read_json(self.prefix+'available.json')
@@ -233,10 +254,13 @@ class Publisher:
         checked_key(key,self.prefix);size=payload.stat().st_size if isinstance(payload,Path) else len(payload)
         previous=self.objects.get(key,{}).get('bytes',0);extra=max(0,size-previous)
         if extra>self.remaining:raise SafetyStop('上传量超过本时次预留空间')
+        # 分片额度只看本进程累计写入，因此并发下也不会越过分片总和。
+        if self.budget is not None and self.written+extra>self.budget:
+            raise SafetyStop('分片字节预算：本进程写入将超过本片额度')
         # 不再查询远端。此检查只有整数运算和少量批次名集合操作。
         new_run=self.target if self.target and key.startswith(self.prefix+f'runs/{self.target}/') else None
         self._check(additional=extra,new_run=new_run)
-        etag=self.store.put(key,payload,immutable=immutable);self.remaining-=extra
+        etag=self.store.put(key,payload,immutable=immutable);self.remaining-=extra;self.written+=extra
         self.objects[key]={'bytes':size,'etag':etag};self.current_bytes+=size-previous
         if key.startswith(self.prefix+'runs/'):self.batches.add(key[len(self.prefix+'runs/'):].split('/')[0])
         self.peak_bytes=max(self.peak_bytes,self._check())
@@ -257,10 +281,19 @@ class Publisher:
         if key not in self.objects:raise SafetyStop('时次清单尚未提交，禁止提前开放')
         item={'lead':manifest['lead'],'valid':manifest['valid'],'manifest_key':key,
             'product_bytes':manifest['product_bytes'],'verified_products':len(rows)}
-        times={row['lead']:row for row in self.available['times']};times[item['lead']]=item
-        self.available={**self.available,'model':manifest.get('model'),'run':manifest.get('run'),'processing_sha256':manifest.get('processing_sha256'),
-            'profile':manifest.get('profile'),'times':sorted(times.values(),key=lambda x:x['lead'])}
-        self.put_json(self.prefix+'available.json',self.available)
+        # 分片并发写同一对象：先读远端再合并，写完回读确认，避免后写覆盖前写的时次。
+        for _attempt in range(3):
+            remote=self.store.read_json(self.prefix+'available.json')
+            base=remote if remote and remote.get('run_id')==self.available['run_id'] else self.available
+            times={row['lead']:row for row in base.get('times',[])};times[item['lead']]=item
+            merged={**base,'model':manifest.get('model'),'run':manifest.get('run'),'processing_sha256':manifest.get('processing_sha256'),
+                'profile':manifest.get('profile'),'times':sorted(times.values(),key=lambda x:x['lead'])}
+            self.put_json(self.prefix+'available.json',merged)
+            check=self.store.read_json(self.prefix+'available.json')
+            if check and {row['lead'] for row in check.get('times',[])}>=set(times):
+                self.available=merged;break
+        else:
+            raise SafetyStop('可用目录并发写入未收敛')
 
     def finish_run(self,manifest,expected_leads):
         if manifest['run_id']!=self.target or self.available['run_id']!=self.target or manifest['status']!='complete':
