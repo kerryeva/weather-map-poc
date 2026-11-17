@@ -21,6 +21,11 @@ TIMESTEP_BUDGET=1500
 class StageTimeout(SafetyStop):
     """单个处理阶段超时：可换更宽松的预算重试一次；仍超时则跳过本时次，不拖死整批。"""
 
+class StageFailure(SafetyStop):
+    """单个处理阶段非零退出：同样重试一次，仍失败就跳过本时次，让其余时次照常发布。"""
+
+MAX_SKIPS=2
+
 def shard_leads(index,count):
     """把完整时次表切成等长的连续分片，最后一片可能更短。"""
     if not 1<=count<=16 or not 0<=index<count:raise SafetyStop('分片参数只允许序号小于总数且总数不超过16')
@@ -110,7 +115,7 @@ def execute(command,monitor,log,timeout=1200,label='处理阶段'):
                 # 并行处理器失败时，清理同一进程组里的孙进程，不能留下几何任务继续占用CPU。
                 try:os.killpg(child.pid,signal.SIGTERM)
                 except ProcessLookupError:pass
-                raise RuntimeError(f'处理阶段退出码 {child.returncode}；查看本地日志 {log.name}')
+                raise StageFailure(f'{label}退出码 {child.returncode}')
         finally:
             if child.poll() is None:
                 os.killpg(child.pid,signal.SIGTERM)
@@ -131,7 +136,7 @@ def execute_stage(command,monitor,log,budget,label,reset=None,deadline=None):
         if allowance<1:raise StageTimeout(f'{label}超时：本时次预算已用完')
         try:
             return execute(command,monitor,log,timeout=int(allowance),label=f'{label}（第{attempt}次）')
-        except StageTimeout:
+        except (StageTimeout,StageFailure):
             if attempt>1:raise
             # 重试用干净目录，避免上一次的半个输出被当成成品。
             if reset is not None:reset()
@@ -392,9 +397,10 @@ def main():
                     one['timings']['cleanup_seconds']=time.monotonic()-cleanup_start
                     one['timings']['time_total_seconds']=time.monotonic()-time_start;save()
                     print(json.dumps({'lead':lead,'status':'verified','products':len(files),'bytes':one['product_bytes'],'work_bytes_after_cleanup':directory_bytes(work)}),flush=True)
-                except StageTimeout as error:
-                    # 单个时次两次都超时：跳过它继续，绝不把整批和已完成的时次一起丢掉。
+                except (StageTimeout,StageFailure) as error:
+                    # 单个时次两次都没成：跳过它继续，绝不把整批和已完成的时次一起丢掉。
                     failures.append({'lead':lead,'reason':str(error)})
+                    if len(failures)>MAX_SKIPS:raise SafetyStop(f'连续时次失败过多（{len(failures)} 个），停止本片')
                     report['failures']=failures;report['current_lead']=None;save()
                     print(json.dumps({'lead':lead,'status':'skipped','reason':str(error)},ensure_ascii=False),flush=True)
                     shutil.rmtree(current,ignore_errors=True)
