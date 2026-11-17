@@ -319,6 +319,8 @@ def main():
                     wait_for_prepare(publisher.store,prefix,run_id)
                     publisher.target=run_id
                 else:
+                    if isinstance(lease,str) and foreign_leases(publisher.store,lease):
+                        raise SafetyStop('其他任务仍在写入，暂不清理旧批次')
                     publisher.prepare(run_id)
                 progress=prefix+f'runs/{run_id}/progress.json' if not shard else prefix+f'runs/{run_id}/progress-p{shard[0]}.json'
                 publisher.put_json(progress,{'run':report['run'],'processing_sha256':fingerprint,'processor_commit':os.environ.get('PROCESSOR_COMMIT'),'status':'incomplete',
@@ -463,8 +465,8 @@ def source_fingerprint():
             if path.suffix in extensions:digest.update(path.name.encode()+b'\0'+path.read_bytes())
     return digest.hexdigest()
 
-def wait_for_prepare(store,prefix,run_id,timeout=900,interval=15):
-    """非 0 号分片等到 0 号分片写好准备标记再上传；超时即停止，绝不自作主张清理旧批。"""
+def wait_for_prepare(store,prefix,run_id,timeout=180,interval=5):
+    """分片等到准备 job 写好标记再上传；超时即停止，绝不自作主张清理旧批。"""
     key=prefix+f'runs/{run_id}/progress-p0.json'
     deadline=time.monotonic()+timeout
     while store.read_json(key) is None:
@@ -486,13 +488,20 @@ def lease_keys():
     """所有可能存在的写入租约键，供「是否有任务正在写」的判定使用。"""
     return [PREFIX+LOCK_NAME]+[PREFIX+f'writer-lock-p{index}.json' for index in range(LOCK_SHARDS)]
 
+def active_leases(store,now=None):
+    """所有仍在有效期内的写入租约（键, 内容）。"""
+    moment=time.time() if now is None else now
+    return [(key,lock) for key in lease_keys()
+        if (lock:=store.read_json(key)) and lock.get('expires',0)>moment]
+
 def active_lease(store,now=None):
     """返回仍在有效期内的写入租约（键, 内容）；全部过期则返回 None。"""
-    moment=time.time() if now is None else now
-    for key in lease_keys():
-        lock=store.read_json(key)
-        if lock and lock.get('expires',0)>moment:return key,lock
-    return None
+    leases=active_leases(store,now)
+    return leases[0] if leases else None
+
+def foreign_leases(store,token,now=None):
+    """排除自己持有的租约后，还在有效期内的其他写入者。"""
+    return [lock for _,lock in active_leases(store,now) if lock.get('token')!=token]
 
 class LeaseHeartbeat:
     """把租约改成短 TTL + 心跳：进程被取消后最多 LEASE_SECONDS 就自动失效，不会再空锁七小时。"""

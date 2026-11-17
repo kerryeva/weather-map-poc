@@ -136,6 +136,20 @@ def candidate_runs(now, completed, unfinished):
 DEFAULT_QUEUE_LIMIT = 1_000_000
 
 
+def retry_delay(previous, cycle, commit):
+    """同一版程序连续失败才加倍退避；换过制图程序就重置，免得一次改配置把批次锁住几小时。"""
+    if previous.get('cycle') != cycle:
+        return 1
+    if previous.get('processor_commit', '') != commit:
+        return 1
+    return min(2, (previous.get('hours', 0) * 2) or 1)
+
+
+def backoff_applies(attempt, commit):
+    """上一次尝试是另外一版程序留下的，就不该继续锁住这一批。"""
+    return attempt.get('processor_commit', '') in ('', commit)
+
+
 def select_job(store, model, now, fetch, queue_limit=DEFAULT_QUEUE_LIMIT):
     prefix = store.prefix
     available = store.read_json(prefix + 'available.json') or {}
@@ -155,7 +169,8 @@ def select_job(store, model, now, fetch, queue_limit=DEFAULT_QUEUE_LIMIT):
         bundle = fetch(run)
         if bundle:
             attempt = store.read_json(prefix + 'scheduler-attempt.json') or {}
-            if attempt.get('cycle') == cycle_id(run) and now.timestamp() < attempt['retry_after']:
+            if (attempt.get('cycle') == cycle_id(run) and now.timestamp() < attempt['retry_after']
+                    and backoff_applies(attempt, os.environ.get('GITHUB_SHA', ''))):
                 larger_queue = queue_limit > attempt.get('queue_limit', DEFAULT_QUEUE_LIMIT)
                 if unfinished != cycle_id(run) or not larger_queue:
                     return 'retry cooling down: ' + cycle_id(run), None
@@ -204,7 +219,7 @@ def main():
         run = stamp(next(iter(json.loads(path.read_text()).values()))['reference_time'])
         attempt_key = store.prefix + 'scheduler-attempt.json'
         previous = store.read_json(attempt_key) or {}
-        delay = min(6, previous.get('hours', 0) * 2 or 1) if previous.get('cycle') == cycle_id(run) else 1
+        delay = retry_delay(previous, cycle_id(run), os.environ['PROCESSOR_COMMIT'])
         store.put(attempt_key, encoded({'cycle':cycle_id(run),'processor_commit':os.environ['PROCESSOR_COMMIT'],'hours':delay,'queue_limit':queue_limit,'retry_after':now.timestamp()+delay*3600}))
         return
     upgrade_four_day_policy(store)
