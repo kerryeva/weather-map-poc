@@ -1,7 +1,7 @@
 """IFS 全批处理入口：冻结起报、逐时次处理、磁盘保险丝、校验后发布。"""
 from pathlib import Path
 from datetime import datetime,timezone
-import argparse,hashlib,json,os,re,shutil,signal,subprocess,sys,threading,time
+import argparse,hashlib,json,os,re,shutil,signal,subprocess,sys,threading,time,traceback
 import requests
 from storage import PREFIX,Publisher,LocalStore,R2Store,SafetyStop,encoded,digests,shard_budget,retained_bytes
 
@@ -38,6 +38,28 @@ def public_error(error,mode):
     safe_code=code if isinstance(code,str) and re.fullmatch('[A-Za-z0-9_.-]{1,60}',code) else ''
     if isinstance(error,SafetyStop) or mode!='r2':return str(error)
     return type(error).__name__+(':'+safe_code if safe_code else '')
+
+def stop_detail(error,mode):
+    """云端可公布的原因：计划内停止用原文；SDK 错误只留类型与错误码；其余保留一句消息。
+
+    旧实现的未知异常只打印类型名，云端日志因此无法区分「渲染崩了」与「收尾写索引崩了」；
+    这里对非 SDK 异常补上消息，SDK 异常仍按 public_error 脱敏。
+    """
+    if isinstance(error,SafetyStop) or mode!='r2':return str(error) or type(error).__name__
+    if type(error).__module__.split('.')[0] in ('botocore','boto3'):return public_error(error,mode)
+    message=' '.join(str(error).split())[:200]
+    return f'{type(error).__name__}：{message}' if message else type(error).__name__
+
+def error_frames(error,limit=8):
+    """只暴露本仓库内的调用位置，用来从云端日志直接定位；不含参数、响应体与凭据。"""
+    rows=[]
+    for frame in traceback.extract_tb(error.__traceback__):
+        path=Path(frame.filename)
+        try:inside=path.resolve().is_relative_to(ROOT)
+        except (OSError,ValueError):inside=False
+        if not inside:continue
+        rows.append(f'{path.resolve().relative_to(ROOT).as_posix()}:{frame.lineno} {frame.name}()')
+    return rows[-limit:]
 
 def step_summary(lines):
     """关键结论写入 GitHub job summary；本地运行没有该环境变量时静默跳过。"""
@@ -479,10 +501,11 @@ def main():
                 f"- 时次：{len(report['times'])}/{len(plan)}｜成品字节：{sum(t['product_bytes'] for t in report['times'])}{skipped}"])
     except Exception as error:
         report['status']='safety_stop' if isinstance(error,SafetyStop) else 'failed'
-        # SDK 错误可能包含账户信息；公开日志只保留错误类型，详细错误不打印凭据。
-        detail=public_error(error,args.mode);STOP_DETAIL['detail']=detail
+        # SDK 错误可能包含账户信息；公开日志只保留错误类型与错误码，详细响应不打印。
+        detail=stop_detail(error,args.mode);STOP_DETAIL['detail']=detail;STOP_DETAIL['mode']=args.mode
         report['error']=detail
-        step_summary(['### 制图停止','',f"- 原因：{detail}",f"- 状态：{report['status']}",f"- 已完成时次：{len(report.get('times',[]))}"])
+        step_summary(['### 制图停止','',f"- 原因：{detail}",f"- 状态：{report['status']}",f"- 已完成时次：{len(report.get('times',[]))}"]
+            +[f"- 位置：{row}" for row in error_frames(error)])
         raise
     finally:
         release_error=None
@@ -607,5 +630,8 @@ if __name__=='__main__':
     try:main()
     except Exception as error:
         # 详细公开错误已由报告脱敏；不把 SDK 响应和环境变量直接输出。
-        detail=STOP_DETAIL.get('detail','')
-        print(f'任务停止：{type(error).__name__}'+(f'：{detail}' if detail else ''),file=sys.stderr);sys.exit(2)
+        mode=STOP_DETAIL.get('mode','r2')
+        detail=STOP_DETAIL.get('detail','') or stop_detail(error,mode)
+        print(f'任务停止：{type(error).__name__}'+(f'：{detail}' if detail and detail!=type(error).__name__ else ''),file=sys.stderr)
+        for row in error_frames(error):print(f'  | {row}',file=sys.stderr)
+        sys.exit(2)
