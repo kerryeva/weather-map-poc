@@ -44,7 +44,8 @@ def digests(path):
 
 def checked_key(key,prefix=PREFIX):
     # 同一桶的全部发布范围共用租约和滚动账本，沿用已有预算。
-    shared=key==PREFIX+'writer-lock.json' or re.fullmatch(re.escape(PREFIX)+r'budgets/(rolling-operations|[0-9]{4}-[0-9]{2})\.json',key)
+    # 写入租约按分片各一把，未分片时仍用 writer-lock.json；它们都在共享根前缀下。
+    shared=re.fullmatch(re.escape(PREFIX)+r'writer-lock(-p\d{1,2})?\.json',key) or re.fullmatch(re.escape(PREFIX)+r'budgets/(rolling-operations|[0-9]{4}-[0-9]{2})\.json',key)
     if (not key.startswith(prefix) and not shared) or '..' in PurePosixPath(key).parts or '\\' in key:
         raise SafetyStop('禁止操作测试前缀以外的对象')
     return key

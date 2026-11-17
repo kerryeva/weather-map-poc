@@ -11,7 +11,7 @@ import requests
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / 'scripts'))
-from batch import acquire_lease, model_store, release_lease
+from batch import active_lease, acquire_lease, model_store, release_lease
 from model_sources import BASE, definition, model_plan, stamp
 from storage import PREFIX, Publisher, RUN_ID, SafetyStop, encoded
 
@@ -82,8 +82,7 @@ def upgrade_four_day_policy(store):
         return
     if existing is not None:
         raise SafetyStop('四天产品升级记录异常')
-    lock = store.read_json(PREFIX + 'writer-lock.json')
-    if lock and lock['expires'] > datetime.now(UTC).timestamp():
+    if active_lease(store, datetime.now(UTC).timestamp()):
         return
     lease = acquire_lease(store)
     try:
@@ -140,8 +139,7 @@ DEFAULT_QUEUE_LIMIT = 1_000_000
 def select_job(store, model, now, fetch, queue_limit=DEFAULT_QUEUE_LIMIT):
     prefix = store.prefix
     available = store.read_json(prefix + 'available.json') or {}
-    lock = store.read_json(PREFIX + 'writer-lock.json')
-    if lock and lock['expires'] > now.timestamp():
+    if active_lease(store, now.timestamp()):
         return f"writer active: {available.get('run_id', 'starting')}, {len(available.get('times', []))}/{len(LEADS)}; next check in 30 min", None
     latest = store.read_json(prefix + 'latest.json') or {}
     for item in (available, latest):

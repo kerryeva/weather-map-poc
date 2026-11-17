@@ -293,9 +293,9 @@ def main():
                     store=model_store(model,prefix)
                 else:
                     store=R2Store(args.bucket)
-                lease=acquire_lease(store)
+                lease=acquire_lease(store,shard)
                 if not isinstance(lease,LocalStore):
-                    heartbeat=LeaseHeartbeat(store,lease).start()
+                    heartbeat=LeaseHeartbeat(store,lease,key=lease_key(shard)).start()
                     # 取消时先走 finally 释放租约，而不是留下长时间的空锁。
                     def _terminate(signum,frame):
                         raise SafetyStop('收到终止信号，提前收尾')
@@ -442,7 +442,7 @@ def main():
         release_error=None
         if heartbeat is not None:heartbeat.stop()
         if lease is not None:
-            try:release_lease(store,lease)
+            try:release_lease(store,lease,shard)
             except Exception as error:
                 release_error=error;report['status']='safety_stop';report['lease_release_error']=type(error).__name__
         report['disk']=monitor.metrics();report['elapsed_seconds']=time.monotonic()-started;save()
@@ -475,16 +475,36 @@ def wait_for_prepare(store,prefix,run_id,timeout=900,interval=15):
 LEASE_SECONDS=1800
 LEASE_RENEW_SECONDS=600
 
+LOCK_NAME='writer-lock.json'
+LOCK_SHARDS=16
+
+def lease_key(shard=None):
+    """每片一把写入租约：同一轮的多片可以并行，不同轮之间仍然互斥。"""
+    return PREFIX+(f'writer-lock-p{shard[0]}.json' if shard else LOCK_NAME)
+
+def lease_keys():
+    """所有可能存在的写入租约键，供「是否有任务正在写」的判定使用。"""
+    return [PREFIX+LOCK_NAME]+[PREFIX+f'writer-lock-p{index}.json' for index in range(LOCK_SHARDS)]
+
+def active_lease(store,now=None):
+    """返回仍在有效期内的写入租约（键, 内容）；全部过期则返回 None。"""
+    moment=time.time() if now is None else now
+    for key in lease_keys():
+        lock=store.read_json(key)
+        if lock and lock.get('expires',0)>moment:return key,lock
+    return None
+
 class LeaseHeartbeat:
     """把租约改成短 TTL + 心跳：进程被取消后最多 LEASE_SECONDS 就自动失效，不会再空锁七小时。"""
-    def __init__(self,store,token,prefix=PREFIX,seconds=LEASE_SECONDS,renew=LEASE_RENEW_SECONDS):
+    def __init__(self,store,token,prefix=PREFIX,seconds=LEASE_SECONDS,renew=LEASE_RENEW_SECONDS,key=None):
         self.store=store;self.token=token;self.prefix=prefix;self.seconds=seconds;self.renew=renew
+        self.key=key or prefix+LOCK_NAME
         self.lost=False;self.beats=0;self._stop=threading.Event();self._thread=None
     def beat(self):
-        lock=self.store.read_json(self.prefix+'writer-lock.json')
+        lock=self.store.read_json(self.key)
         if not lock or lock.get('token')!=self.token:
             self.lost=True;return False
-        self.store.put(self.prefix+'writer-lock.json',encoded({'token':self.token,'expires':time.time()+self.seconds}))
+        self.store.put(self.key,encoded({'token':self.token,'expires':time.time()+self.seconds}))
         self.beats+=1;return True
     def _loop(self):
         while not self._stop.wait(self.renew):
@@ -494,14 +514,14 @@ class LeaseHeartbeat:
     def stop(self):
         self._stop.set()
 
-def acquire_lease(store):
+def acquire_lease(store,shard=None):
     """排他租约：TTL 由心跳续期（默认 30 分钟，每 10 分钟一次），进程被取消也不会长时间占锁。"""
     import uuid
     token=uuid.uuid4().hex;payload={'token':token,'expires':time.time()+LEASE_SECONDS}
-    key=PREFIX+'writer-lock.json'
+    key=lease_key(shard)
     if isinstance(store,LocalStore):
         import fcntl
-        stream=(store.root/'.writer.lock').open('w')
+        stream=(store.root/(f'.writer-p{shard[0]}.lock' if shard else '.writer.lock')).open('w')
         try:fcntl.flock(stream,fcntl.LOCK_EX|fcntl.LOCK_NB)
         except BlockingIOError:
             stream.close();raise SafetyStop('已有生产任务持有写入锁')
@@ -522,12 +542,13 @@ def acquire_lease(store):
         raise SafetyStop('未能独占生产租约，禁止并发上传') from error
     return token
 
-def release_lease(store,lease):
+def release_lease(store,lease,shard=None):
     if isinstance(store,LocalStore):lease.close();return
-    current=store.read_json(PREFIX+'writer-lock.json')
+    key=lease_key(shard)
+    current=store.read_json(key)
     if not current or current.get('token')!=lease or current.get('expires',0)<=time.time():
         raise SafetyStop('写入租约归属或有效期异常')
-    store.delete([PREFIX+'writer-lock.json'])
+    store.delete([key])
 
 if __name__=='__main__':
     try:main()
