@@ -11,6 +11,15 @@ SOURCE=SPATIAL+'ecmwf_ifs025/'
 UTC=timezone.utc
 FULL_LEADS=list(range(0,97,3))
 STOP_DETAIL={}
+# 四片并行后每片只有 9 个时次、5 小时上限摊下来每时次约 33 分钟，阶段预算可以按实测放宽：
+# 抽取、重网格各 10 分钟，渲染 20 分钟；单时次总预算 25 分钟，9 个时次最多 3.75 小时，
+# 仍留出整批熔断（5 小时）的余量。超时不再当作安全停止，而是重试一次后跳过该时次。
+STAGE_BUDGETS={'extract':600,'regrid':600,'render':1200}
+STAGE_RETRY_FACTOR=1.5
+TIMESTEP_BUDGET=1500
+
+class StageTimeout(SafetyStop):
+    """单个处理阶段超时：可换更宽松的预算重试一次；仍超时则跳过本时次，不拖死整批。"""
 
 def shard_leads(index,count):
     """把完整时次表切成等长的连续分片，最后一片可能更短。"""
@@ -85,7 +94,7 @@ class DiskMonitor:
             'min_free_bytes':self.min_free,'max_work_bytes':self.max_work,
             'note':'工作目录为抽样峰值；不包含目录外依赖、操作系统和其他进程占用。磁盘剩余量包含同一文件系统所有占用。'}
 
-def execute(command,monitor,log,timeout=1200):
+def execute(command,monitor,log,timeout=1200,label='处理阶段'):
     start=time.monotonic()
     with log.open('w') as stream:
         child=subprocess.Popen(command,stdout=stream,stderr=subprocess.STDOUT,start_new_session=True,cwd=ROOT)
@@ -93,7 +102,8 @@ def execute(command,monitor,log,timeout=1200):
         try:
             while child.poll() is None:
                 monitor.check()
-                if time.monotonic()-start>timeout:raise SafetyStop('单时次处理超时')
+                if time.monotonic()-start>timeout:
+                    raise StageTimeout(f'{label}超时：已用{int(time.monotonic()-start)}秒，预算{timeout}秒')
                 time.sleep(.2)
             monitor.check()
             if child.returncode:
@@ -109,6 +119,23 @@ def execute(command,monitor,log,timeout=1200):
                     os.killpg(child.pid,signal.SIGKILL);child.wait()
             monitor.child=None
     return time.monotonic()-start
+
+def execute_stage(command,monitor,log,budget,label,reset=None,deadline=None):
+    """阶段超时按 1.5 倍预算重试一次；仍超时抛 StageTimeout，由主循环跳过本时次。
+
+    每个阶段实际可用时间还会被「本时次剩余预算」截断，因此放宽阶段预算不会超过
+    整批熔断，也不会让一个坏时次吃掉后面时次的时间。"""
+    for attempt,seconds in enumerate((budget,int(budget*STAGE_RETRY_FACTOR)),1):
+        allowance=seconds
+        if deadline is not None:allowance=min(seconds,max(0,deadline-time.monotonic()))
+        if allowance<1:raise StageTimeout(f'{label}超时：本时次预算已用完')
+        try:
+            return execute(command,monitor,log,timeout=int(allowance),label=f'{label}（第{attempt}次）')
+        except StageTimeout:
+            if attempt>1:raise
+            # 重试用干净目录，避免上一次的半个输出被当成成品。
+            if reset is not None:reset()
+            monitor.sample();monitor.check()
 
 def _download_once(url,path,monitor,session):
     start=time.monotonic();part=path.with_suffix('.part')
@@ -138,7 +165,7 @@ def download(url,path,monitor,session):
             if attempt==2:raise
             monitor.check();time.sleep(3)
 
-def prepare_fields(item,spec,current,monitor,session,log_dir):
+def prepare_fields(item,spec,current,monitor,session,log_dir,deadline=None):
     fields=current/'fields'
     lead=item['lead']
     sources=[];source_fields=[];extract_seconds=0;regrid_seconds=0
@@ -146,13 +173,14 @@ def prepare_fields(item,spec,current,monitor,session,log_dir):
         domain=source['domain'];native=current/domain;om=current/(domain+'.om')
         metrics=download(source['url'],om,monitor,session)
         names=[f['variable'] for f in spec['fields'] if f['domain']==domain]
-        extract_seconds+=execute([sys.executable,str(ROOT/'scripts/extract.py'),str(om),str(native),json.dumps(names),str(lead),domain],
-            monitor,log_dir/f'F{lead:03}-{domain}-extract.log',timeout=300)
+        extract_seconds+=execute_stage([sys.executable,str(ROOT/'scripts/extract.py'),str(om),str(native),json.dumps(names),str(lead),domain],
+            monitor,log_dir/f'F{lead:03}-{domain}-extract.log',STAGE_BUDGETS['extract'],'抽取',
+            reset=lambda: shutil.rmtree(native,ignore_errors=True),deadline=deadline)
         entries=json.loads((native/'metadata.json').read_text())
         source_fields.extend([{**row,'domain':domain} for row in entries]);om.unlink()
         config=current/'regrid.json';config.write_text(json.dumps({'inputDir':str(native),'outputDir':str(fields),'domain':domain}))
-        regrid_seconds+=execute(['node',str(ROOT/'scripts/regrid.mjs'),str(config)],monitor,
-            log_dir/f'F{lead:03}-{domain}-regrid.log',timeout=300)
+        regrid_seconds+=execute_stage(['node',str(ROOT/'scripts/regrid.mjs'),str(config)],monitor,
+            log_dir/f'F{lead:03}-{domain}-regrid.log',STAGE_BUDGETS['regrid'],'重网格',deadline=deadline)
         shutil.rmtree(native);sources.append({**source,**metrics});monitor.sample();monitor.check()
     return sources,source_fields,extract_seconds,regrid_seconds
 
@@ -298,7 +326,7 @@ def main():
                 if args.prepare_only:
                     step_summary(['### 批次准备完成','',f"- 模式：{model}｜起报：{report['run']}",f"- run_id：{run_id}",f"- 时次：{len(plan)}"])
                     print(json.dumps({'status':'prepared','run_id':run_id,'leads':len(plan),'run':report['run']}));return
-            report['status']='running';save()
+            report['status']='running';failures=[];report['failures']=failures;save()
             for item in plan:
                 if time.monotonic()-started>5*3600:raise SafetyStop('整批任务接近时间上限')
                 if heartbeat is not None and heartbeat.lost:raise SafetyStop('写入租约已被其他任务接管，本进程停止上传')
@@ -314,53 +342,67 @@ def main():
                 current.mkdir();outputs=current/'output';scratch=current/'scratch'
                 report['current_lead']=lead;report['disk']=monitor.metrics();save()
                 time_start=time.monotonic()
-                sources,source_fields,extraction_seconds,regrid_seconds=prepare_fields(item,definition,current,monitor,session,report_path.parent)
-                job={'model':model,'fieldsDir':str(current/'fields'),'scratchDir':str(scratch),'outputDir':str(outputs),
-                    'profile':args.profile,'lead':lead,'maxzoom':args.maxzoom,'python':sys.executable,'productWorkers':args.product_workers}
-                config=current/'job.json';config.write_text(json.dumps(job))
-                render_script='render-pool.mjs' if args.product_workers>1 else 'render.mjs'
-                render_seconds=execute(['node','--max-old-space-size=4096',str(ROOT/'scripts'/render_script),str(config)],monitor,
-                    report_path.parent/f'F{lead:03}.log')
-                rows=json.loads((outputs/'products.json').read_text())
-                if [r['key'] for r in rows]!=[r['key'] for r in definition['products']]:
-                    raise ValueError('生成清单缺少产品或顺序异常')
-                files=[];verify_start=time.monotonic()
-                for row in rows:
-                    if row['status']=='not_applicable':
-                        if lead!=0 or '-rain-' not in row['key']:raise ValueError('不允许静默跳过产品')
-                        continue
-                    path=Path(row['file']);sha,md5=digests(path)
-                    if row['status']!='verified' or sha!=row['sha256'] or path.stat().st_size!=row['bytes']:
-                        raise ValueError('上传前成品校验不一致')
-                    row['md5']=md5;row['object_key']=time_key+path.name;files.append((row['object_key'],path))
-                verify_seconds=time.monotonic()-verify_start;reserve_seconds=0
-                if publisher:
-                    reserve_start=time.monotonic();publisher.reserve_time(files);reserve_seconds=time.monotonic()-reserve_start
-                upload_start=time.monotonic()
-                for row in rows:
-                    if row['status']!='verified':continue
-                    if publisher and not publisher.matches(row['object_key'],row['bytes'],row['md5']):
-                        publisher.put(row['object_key'],Path(row['file']),immutable=True)
-                    row.pop('file',None)
-                upload_seconds=time.monotonic()-upload_start
-                one={**item,'model':model,'run':report['run'],'profile':args.profile,'processing_sha256':fingerprint,'products':rows,'source':sources[0],'sources':sources,'source_fields':source_fields,
-                    'product_bytes':sum(r.get('bytes',0) for r in rows),'rain_accumulation_hours':None if lead==0 else (3 if model=='IFS' else 1)}
-                one['timings']={'regrid_seconds':regrid_seconds,'download_seconds':sum(s['download_seconds'] for s in sources),'extraction_seconds':extraction_seconds,
-                    'render_seconds':render_seconds,'pre_upload_verify_seconds':verify_seconds,
-                    'storage_backend':args.mode,'storage_snapshot_and_reservation_seconds':reserve_seconds,'product_upload_seconds':upload_seconds if publisher else 0}
-                publish_start=time.monotonic()
-                if publisher:
-                    publisher.put_json(manifest_key,one)
-                    publisher.publish_time(one)
-                one['timings']['catalog_publish_seconds']=time.monotonic()-publish_start if publisher else 0
-                one['timings']['time_until_ready_seconds']=time.monotonic()-time_start if publisher else None
-                report['times'].append(one);monitor.sample();monitor.check()
-                report['disk']=monitor.metrics();report['elapsed_seconds']=time.monotonic()-started;save()
-                cleanup_start=time.monotonic();shutil.rmtree(current)
-                one['timings']['cleanup_seconds']=time.monotonic()-cleanup_start
-                one['timings']['time_total_seconds']=time.monotonic()-time_start;save()
-                print(json.dumps({'lead':lead,'status':'verified','products':len(files),'bytes':one['product_bytes'],'work_bytes_after_cleanup':directory_bytes(work)}),flush=True)
-            if len(report['times'])!=len(plan):raise ValueError('整批时次未全部完成')
+                try:
+                    deadline=time_start+TIMESTEP_BUDGET
+                    sources,source_fields,extraction_seconds,regrid_seconds=prepare_fields(item,definition,current,monitor,session,report_path.parent,deadline=deadline)
+                    job={'model':model,'fieldsDir':str(current/'fields'),'scratchDir':str(scratch),'outputDir':str(outputs),
+                        'profile':args.profile,'lead':lead,'maxzoom':args.maxzoom,'python':sys.executable,'productWorkers':args.product_workers}
+                    config=current/'job.json';config.write_text(json.dumps(job))
+                    render_script='render-pool.mjs' if args.product_workers>1 else 'render.mjs'
+                    render_seconds=execute_stage(['node','--max-old-space-size=4096',str(ROOT/'scripts'/render_script),str(config)],monitor,
+                        report_path.parent/f'F{lead:03}.log',STAGE_BUDGETS['render'],'渲染',deadline=deadline)
+                    rows=json.loads((outputs/'products.json').read_text())
+                    if [r['key'] for r in rows]!=[r['key'] for r in definition['products']]:
+                        raise ValueError('生成清单缺少产品或顺序异常')
+                    files=[];verify_start=time.monotonic()
+                    for row in rows:
+                        if row['status']=='not_applicable':
+                            if lead!=0 or '-rain-' not in row['key']:raise ValueError('不允许静默跳过产品')
+                            continue
+                        path=Path(row['file']);sha,md5=digests(path)
+                        if row['status']!='verified' or sha!=row['sha256'] or path.stat().st_size!=row['bytes']:
+                            raise ValueError('上传前成品校验不一致')
+                        row['md5']=md5;row['object_key']=time_key+path.name;files.append((row['object_key'],path))
+                    verify_seconds=time.monotonic()-verify_start;reserve_seconds=0
+                    if publisher:
+                        reserve_start=time.monotonic();publisher.reserve_time(files);reserve_seconds=time.monotonic()-reserve_start
+                    upload_start=time.monotonic()
+                    for row in rows:
+                        if row['status']!='verified':continue
+                        if publisher and not publisher.matches(row['object_key'],row['bytes'],row['md5']):
+                            publisher.put(row['object_key'],Path(row['file']),immutable=True)
+                        row.pop('file',None)
+                    upload_seconds=time.monotonic()-upload_start
+                    one={**item,'model':model,'run':report['run'],'profile':args.profile,'processing_sha256':fingerprint,'products':rows,'source':sources[0],'sources':sources,'source_fields':source_fields,
+                        'product_bytes':sum(r.get('bytes',0) for r in rows),'rain_accumulation_hours':None if lead==0 else (3 if model=='IFS' else 1)}
+                    one['timings']={'regrid_seconds':regrid_seconds,'download_seconds':sum(s['download_seconds'] for s in sources),'extraction_seconds':extraction_seconds,
+                        'render_seconds':render_seconds,'pre_upload_verify_seconds':verify_seconds,
+                        'storage_backend':args.mode,'storage_snapshot_and_reservation_seconds':reserve_seconds,'product_upload_seconds':upload_seconds if publisher else 0}
+                    publish_start=time.monotonic()
+                    if publisher:
+                        publisher.put_json(manifest_key,one)
+                        publisher.publish_time(one)
+                    one['timings']['catalog_publish_seconds']=time.monotonic()-publish_start if publisher else 0
+                    one['timings']['time_until_ready_seconds']=time.monotonic()-time_start if publisher else None
+                    report['times'].append(one);monitor.sample();monitor.check()
+                    report['disk']=monitor.metrics();report['elapsed_seconds']=time.monotonic()-started;save()
+                    cleanup_start=time.monotonic();shutil.rmtree(current)
+                    one['timings']['cleanup_seconds']=time.monotonic()-cleanup_start
+                    one['timings']['time_total_seconds']=time.monotonic()-time_start;save()
+                    print(json.dumps({'lead':lead,'status':'verified','products':len(files),'bytes':one['product_bytes'],'work_bytes_after_cleanup':directory_bytes(work)}),flush=True)
+                except StageTimeout as error:
+                    # 单个时次两次都超时：跳过它继续，绝不把整批和已完成的时次一起丢掉。
+                    failures.append({'lead':lead,'reason':str(error)})
+                    report['failures']=failures;report['current_lead']=None;save()
+                    print(json.dumps({'lead':lead,'status':'skipped','reason':str(error)},ensure_ascii=False),flush=True)
+                    shutil.rmtree(current,ignore_errors=True)
+                    continue
+            if len(report['times'])+len(failures)!=len(plan):raise ValueError('整批时次未全部完成')
+            complete=not failures
+            if not complete:
+                # 有跳过的时次：本轮不写完成索引，插件按已发布的时次数显示，下一轮从这里续做。
+                print(json.dumps({'status':'incomplete','run_id':run_id,'completed':len(report['times']),
+                    'skipped':[row['lead'] for row in failures],'total':len(plan)},ensure_ascii=False),flush=True)
             if publisher:
                 times=list(report['times']);expected=[t['lead'] for t in plan]
                 if shard:
@@ -372,6 +414,11 @@ def main():
                     else:
                         times=[{'lead':row['lead'],'valid':row['valid'],'product_bytes':row['product_bytes']} for row in publisher.available['times']]
                         expected=FULL_LEADS
+                if times and not complete:
+                    # 有跳过的时次：本轮不写完成索引，插件按已发布的时次数显示，下一轮从这里续做。
+                    print(json.dumps({'status':'incomplete','run_id':run_id,'completed':len(report['times']),
+                        'skipped':[row['lead'] for row in failures],'total':len(plan)}),flush=True)
+                    times=None
                 if times:
                     manifest={'run_id':run_id,'run':report['run'],'processing_sha256':fingerprint,'status':'complete',
                         'profile':args.profile,'times':[{'lead':t['lead'],'valid':t['valid'],'product_bytes':t['product_bytes']} for t in times],
@@ -380,8 +427,10 @@ def main():
                 report['store']={'observed_peak_bytes':publisher.peak_bytes,'final_tracked_bytes':publisher.current_bytes,
                     'batch_count':len(publisher.batches),'application_requests':publisher.store.requests,
                     'note':'SDK 自动重试次数不在 application_requests 中；A 类预算按每次调用最多两次尝试预留。'}
-            report['status']='complete'
-            step_summary(['### 制图完成','',f"- 模式：{model}｜起报：{report['run']}",f"- 时次：{len(report['times'])}｜成品字节：{sum(t['product_bytes'] for t in report['times'])}"])
+            report['status']='complete' if complete else 'incomplete'
+            skipped=('｜跳过：'+','.join(f"F{row['lead']:03d}" for row in failures)) if failures else ''
+            step_summary(['### 制图完成' if complete else '### 制图部分完成','',f"- 模式：{model}｜起报：{report['run']}",
+                f"- 时次：{len(report['times'])}/{len(plan)}｜成品字节：{sum(t['product_bytes'] for t in report['times'])}{skipped}"])
     except Exception as error:
         report['status']='safety_stop' if isinstance(error,SafetyStop) else 'failed'
         # SDK 错误可能包含账户信息；公开日志只保留错误类型，详细错误不打印凭据。
