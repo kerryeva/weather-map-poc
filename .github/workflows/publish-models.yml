@@ -15,23 +15,37 @@ on:
 permissions:
   contents: read
 jobs:
+  # 自动触发拆四片并行；手动触发（height/full）仍是单任务跑全量。
+  plan:
+    runs-on: ubuntu-24.04
+    outputs:
+      shards: ${{ steps.pick.outputs.shards }}
+    steps:
+      - id: pick
+        shell: bash
+        run: |
+          if [ "${{ inputs.scope || 'auto' }}" = 'auto' ]; then
+            echo 'shards=[0,1,2,3]' >> "$GITHUB_OUTPUT"
+          else
+            echo 'shards=[0]' >> "$GITHUB_OUTPUT"
+          fi
   publish:
+    needs: plan
     strategy:
       fail-fast: false
       matrix:
         model: [IFS, GFS]
-        shard: ['0/4', '1/4', '2/4', '3/4']
-    # 手动触发仍按单任务跑全量；自动触发才拆成四片（每模型 4 个 job），每片各有独立并发组。
-    if: ${{ (inputs.scope || 'auto') != 'auto' && matrix.shard == '0/4' || (inputs.scope || 'auto') == 'auto' }}
+        shard: ${{ fromJSON(needs.plan.outputs.shards) }}
+        total: [4]
     runs-on: ubuntu-24.04
     timeout-minutes: 330
     env:
       POLYGON_CLIPPING_MAX_QUEUE_SIZE: '2000000'
       MODEL: ${{ matrix.model }}
-      SHARD: ${{ matrix.shard }}
+      SHARD: ${{ matrix.shard }}/${{ matrix.total }}
       SCOPE: ${{ inputs.scope || 'auto' }}
     concurrency:
-      group: auto-weather-${{ matrix.model }}-${{ replace(matrix.shard, '/', '-') }}
+      group: auto-weather-${{ matrix.model }}-${{ matrix.shard }}
       cancel-in-progress: false
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
