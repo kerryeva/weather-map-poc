@@ -73,6 +73,8 @@ jobs:
           GFS_PUBLISH: ${{ steps.gfs.outputs.publish }}
           PROCESSOR_IFS: ${{ steps.ifs.outputs.processor }}
           PROCESSOR_GFS: ${{ steps.gfs.outputs.processor }}
+          IFS_R2_ACCOUNT_ID: ${{ secrets.IFS_R2_ACCOUNT_ID }}
+          GFS_R2_ACCOUNT_ID: ${{ secrets.GFS_R2_ACCOUNT_ID }}
           IFS_BUCKET: ${{ secrets.IFS_R2_BUCKET }}
           IFS_KEY: ${{ secrets.IFS_R2_ACCESS_KEY_ID }}
           IFS_SECRET: ${{ secrets.IFS_R2_SECRET_ACCESS_KEY }}
