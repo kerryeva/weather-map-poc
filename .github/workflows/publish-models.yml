@@ -71,8 +71,6 @@ jobs:
         env:
           IFS_PUBLISH: ${{ steps.ifs.outputs.publish }}
           GFS_PUBLISH: ${{ steps.gfs.outputs.publish }}
-          PROCESSOR_IFS: ${{ steps.ifs.outputs.processor }}
-          PROCESSOR_GFS: ${{ steps.gfs.outputs.processor }}
           IFS_R2_ACCOUNT_ID: ${{ secrets.IFS_R2_ACCOUNT_ID }}
           GFS_R2_ACCOUNT_ID: ${{ secrets.GFS_R2_ACCOUNT_ID }}
           IFS_BUCKET: ${{ secrets.IFS_R2_BUCKET }}
@@ -101,18 +99,16 @@ jobs:
               --shard 0/4 --prepare-only --product-workers 4 --work "$RUNNER_TEMP/work" --report "$RUNNER_TEMP/report/run.json"
           }
           if [ "$IFS_PUBLISH" = 'true' ]; then
-            prepare IFS "$RUNNER_TEMP/scheduled-metadata-IFS.json" "$PROCESSOR_IFS"
+            prepare IFS "$RUNNER_TEMP/scheduled-metadata-IFS.json" "$GITHUB_SHA"
           fi
           if [ "$GFS_PUBLISH" = 'true' ]; then
-            prepare GFS "$RUNNER_TEMP/scheduled-metadata-GFS.json" "$PROCESSOR_GFS"
+            prepare GFS "$RUNNER_TEMP/scheduled-metadata-GFS.json" "$GITHUB_SHA"
           fi
       - name: Choose shard targets
         id: plan
         env:
           IFS_PUBLISH: ${{ steps.ifs.outputs.publish }}
           GFS_PUBLISH: ${{ steps.gfs.outputs.publish }}
-          PROCESSOR_IFS: ${{ steps.ifs.outputs.processor }}
-          PROCESSOR_GFS: ${{ steps.gfs.outputs.processor }}
         shell: bash
         run: |
           python - <<'PY'
@@ -122,9 +118,10 @@ jobs:
           if scope == 'auto':
               for model in ('IFS', 'GFS'):
                   if os.environ.get(model + '_PUBLISH') == 'true':
+                      # 分片矩阵固定用本次运行的代码：旧版本没有 --shard，恢复旧处理器只会在第一步就退出。
                       for shard in range(4):
                           targets.append({'model': model, 'shard': shard, 'total': 4,
-                                          'processor': os.environ.get(model + '_PROCESSOR') or os.environ['GITHUB_SHA']})
+                                          'processor': os.environ['GITHUB_SHA']})
           else:
               # 手动触发是诊断入口，始终单任务跑全量，不受源站就绪判断影响。
               for model in ('IFS', 'GFS'):
