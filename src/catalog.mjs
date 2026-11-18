@@ -11,7 +11,7 @@ export const STYLES = {
   rh:bands([85,90,95,100], ['#b6dceb','#6bb2d2','#247eac']),
   dew:bands([0,2,4], ['#307fb2','#9ccfe2']),
   rain:bands([.1,1,2.5,5,10,25,50,100], ['#c0e5d5','#8bceaa','#4fad83','#219eac','#357db4','#6655ad','#a43c9b']),
-  cape:bands(Array.from({length:16}, (_,i)=>500+i*100), Array.from({length:16}, (_,i)=>`rgb(${Math.round(211-i*3.8)},${Math.round(184-i*4.2)},${Math.round(232-i*2.4)})`)),
+  cape:bands([500,1000,1500,2000,2500], ['#c8e6b4','#8ccd78','#fadc5a','#f08c3c','#c82832']),
   vort:bands([-40,-20,-12,-8,-4,4,8,12,20,40], ['#187e9c','#339bbb','#69b6ca','#aed6df',null,'#fff0aa','#f4d364','#dfad31','#bb811b']),
   div:dynamicScale('div'),
   vertical:dynamicScale('vertical'),

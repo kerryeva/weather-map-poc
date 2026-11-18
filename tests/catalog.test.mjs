@@ -83,12 +83,15 @@ test('动力填色的分档、零值和两个严格越界的端点',async()=>{
 });
 
 
-test('CAPE 2000及以上共用端色，低值保持原分档',()=>{
-  assert.notEqual(colorFor('cape',1900),colorFor('cape',2000));
-  assert.equal(colorFor('cape',2000),colorFor('cape',4000));
-  assert.equal(colorFor('cape',2000),colorFor('cape',10000));
+test('CAPE 五档色标：500 以下不生成，2500 及以上共用端色',()=>{
+  assert.equal(colorFor('cape',500),null);
+  assert.ok(colorFor('cape',501));
+  assert.notEqual(colorFor('cape',999),colorFor('cape',1000));
+  assert.notEqual(colorFor('cape',1999),colorFor('cape',2000));
+  assert.equal(colorFor('cape',2500),colorFor('cape',4000));
+  assert.equal(colorFor('cape',2500),colorFor('cape',10000));
   const grid={nx:8,ny:5,lonMin:-180,latMin:-90,dx:45,dy:45};
   const geo=fillBands('cape',new Float32Array(40).fill(3000),grid);
   assert.ok(geo.features.length);
-  assert.ok(geo.features.every(f=>f.properties.capeScaleVersion===2));
+  assert.ok(geo.features.every(f=>f.properties.capeScaleVersion===3));
 });
