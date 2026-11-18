@@ -50,6 +50,20 @@ def stop_detail(error,mode):
     message=' '.join(str(error).split())[:200]
     return f'{type(error).__name__}：{message}' if message else type(error).__name__
 
+TRANSIENT_CODES=('InternalError','ServiceUnavailable','SlowDown','RequestTimeout','Throttling','RequestTimeTooSkewed','500','502','503','504')
+
+def transient_storage_error(error):
+    """存储服务的临时故障（5xx 或限流）。
+
+    R2 偶发 InternalError 时，最合理的处理是稍后重试，而不是把已跑完的批次判红：
+    发布对象按内容寻址，重试要么命中已有对象、要么补齐缺的那几个。
+    """
+    if type(error).__module__.split('.')[0] not in ('botocore','boto3'):return False
+    response=getattr(error,'response',None) or {}
+    status=response.get('ResponseMetadata',{}).get('HTTPStatusCode',0) or 0
+    code=response.get('Error',{}).get('Code','')
+    return status>=500 or code in TRANSIENT_CODES
+
 def error_frames(error,limit=8):
     """只暴露本仓库内的调用位置，用来从云端日志直接定位；不含参数、响应体与凭据。"""
     rows=[]
@@ -450,6 +464,14 @@ def main():
                     report['current_lead']=None;save()
                     shutil.rmtree(current,ignore_errors=True)
                     return str(error)
+                except Exception as error:
+                    if not transient_storage_error(error):
+                        report['current_lead']=None;save()
+                        raise
+                    # 存储服务临时故障：已上传的对象按内容寻址保留，整批末尾统一重试该时次。
+                    report['current_lead']=None;save()
+                    shutil.rmtree(current,ignore_errors=True)
+                    return '存储服务暂时不可用：'+public_error(error,args.mode)
                 return None
             for item in plan:
                 if time.monotonic()-started>5*3600:raise SafetyStop('整批任务接近时间上限')
@@ -509,13 +531,22 @@ def main():
         raise
     finally:
         release_error=None
+        failing=sys.exc_info()[0] is not None
         if heartbeat is not None:heartbeat.stop()
         if lease is not None:
             try:release_lease(store,lease,shard)
             except Exception as error:
-                release_error=error;report['status']='safety_stop';report['lease_release_error']=type(error).__name__
+                release_error=error
         report['disk']=monitor.metrics();report['elapsed_seconds']=time.monotonic()-started;save()
-        if release_error:raise SafetyStop('写入租约未正常释放；停止后续生产并保留资料') from release_error
+        if release_error is not None:
+            # 租约自带 30 分钟有效期，临时故障不再把已完成的批次判红；
+            # 主体已经在抛异常时也只记一笔，避免把真正的失败原因盖掉。
+            if transient_storage_error(release_error) or failing:
+                report['lease_release_error']=type(release_error).__name__
+                print(json.dumps({'status':'lease_release_deferred','reason':public_error(release_error,args.mode)}),file=sys.stderr,flush=True)
+            else:
+                report['status']='safety_stop';report['lease_release_error']=type(release_error).__name__
+                raise SafetyStop('写入租约未正常释放；停止后续生产并保留资料') from release_error
 
 def model_store(model,prefix):
     accounts=[os.environ.get(name+'_R2_ACCOUNT_ID','') for name in ('IFS','GFS')]
@@ -575,13 +606,20 @@ class LeaseHeartbeat:
     def __init__(self,store,token,prefix=PREFIX,seconds=LEASE_SECONDS,renew=LEASE_RENEW_SECONDS,key=None):
         self.store=store;self.token=token;self.prefix=prefix;self.seconds=seconds;self.renew=renew
         self.key=key or prefix+LOCK_NAME
-        self.lost=False;self.beats=0;self._stop=threading.Event();self._thread=None
+        self.lost=False;self.beats=0;self.errors=0;self._stop=threading.Event();self._thread=None
     def beat(self):
-        lock=self.store.read_json(self.key)
-        if not lock or lock.get('token')!=self.token:
-            self.lost=True;return False
-        self.store.put(self.key,encoded({'token':self.token,'expires':time.time()+self.seconds}))
-        self.beats+=1;return True
+        try:
+            lock=self.store.read_json(self.key)
+            if not lock or lock.get('token')!=self.token:
+                self.lost=True;return False
+            self.store.put(self.key,encoded({'token':self.token,'expires':time.time()+self.seconds}))
+        except Exception as error:
+            # 临时性存储故障不该让心跳线程退出；连续三次都续不上（约 30 分钟）等同租约已失效。
+            if not transient_storage_error(error):raise
+            self.errors+=1
+            if self.errors>=3:self.lost=True;return False
+            return True
+        self.errors=0;self.beats+=1;return True
     def _loop(self):
         while not self._stop.wait(self.renew):
             if not self.beat():return
@@ -618,13 +656,18 @@ def acquire_lease(store,shard=None):
         raise SafetyStop('未能独占生产租约，禁止并发上传') from error
     return token
 
-def release_lease(store,lease,shard=None):
+def release_lease(store,lease,shard=None,attempts=3):
     if isinstance(store,LocalStore):lease.close();return
     key=lease_key(shard)
-    current=store.read_json(key)
-    if not current or current.get('token')!=lease or current.get('expires',0)<=time.time():
-        raise SafetyStop('写入租约归属或有效期异常')
-    store.delete([key])
+    for attempt in range(1,attempts+1):
+        try:
+            current=store.read_json(key)
+            if not current or current.get('token')!=lease or current.get('expires',0)<=time.time():
+                raise SafetyStop('写入租约归属或有效期异常')
+            store.delete([key]);return
+        except Exception as error:
+            if attempt==attempts or not transient_storage_error(error):raise
+            time.sleep(2*attempt)
 
 if __name__=='__main__':
     try:main()

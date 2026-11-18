@@ -113,7 +113,7 @@ class R2Store:
             raise SafetyStop('缺少受限的 R2 读写凭据；不使用匿名或公开访问替代')
         self.client=boto3.client('s3',endpoint_url=f'https://{account}.r2.cloudflarestorage.com',
             aws_access_key_id=credentials['AWS_ACCESS_KEY_ID'],aws_secret_access_key=credentials['AWS_SECRET_ACCESS_KEY'],
-            region_name='auto',config=Config(retries={'total_max_attempts':2,'mode':'standard'},
+            region_name='auto',config=Config(retries={'total_max_attempts':5,'mode':'standard'},
             connect_timeout=15,read_timeout=90,request_checksum_calculation='when_required',
             response_checksum_validation='when_required'))
 
