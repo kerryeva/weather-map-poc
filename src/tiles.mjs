@@ -4,15 +4,17 @@ import {once} from 'node:events';import {createInterface} from 'node:readline';
 import {spawnSync} from 'node:child_process';import {gzipSync,gunzipSync} from 'node:zlib';
 import geojsonvt from 'geojson-vt';import vtpbf from 'vt-pbf';import {VectorTile} from '@mapbox/vector-tile';import {PbfReader} from 'pbf';
 
-export async function buildTiles(geojson,folder,{maxzoom=5,python='python3',clean=true,saveDecoded=false}={}){
+// tolerance 以瓦片坐标计，extent 8192 铺 512px，故 16 单位 = 1 CSS 像素；
+// geojson-vt 在 maxZoom 强制不平滑，z0–z4 统一 1 像素容差。minArea 同理为平方单位。
+export async function buildTiles(geojson,folder,{maxzoom=5,python='python3',clean=true,saveDecoded=false,tolerance=16,minArea=256}={}){
  await mkdir(folder,{recursive:true});await rm(folder+'/tiles',{recursive:true,force:true});
- const idx=geojsonvt(geojson,{maxZoom:maxzoom,indexMaxZoom:maxzoom,indexMaxPoints:0,tolerance:.5,extent:8192,buffer:64});
+ const idx=geojsonvt(geojson,{maxZoom:maxzoom,indexMaxZoom:maxzoom,indexMaxPoints:0,tolerance,extent:8192,buffer:64});
  const raw=folder+'/tile-input.jsonl',ready=folder+'/tile-ready.jsonl',stream=createWriteStream(raw);
  for(let z=0;z<=maxzoom;z++)for(let x=0;x<2**z;x++)for(let y=0;y<2**z;y++){
   const tile=idx.getTile(z,x,y);if(!tile?.features.length)continue;
   if(!stream.write(JSON.stringify({z,x,y,features:tile.features})+'\n'))await once(stream,'drain');
  }stream.end();await once(stream,'finish');
- if(clean){const r=spawnSync(python,[new URL('../scripts/clean_tiles.py',import.meta.url).pathname,raw,ready],{encoding:'utf8',maxBuffer:1048576});if(r.status!==0)throw Error('瓦片几何处理失败：'+r.stderr);}
+ if(clean){const r=spawnSync(python,[new URL('../scripts/clean_tiles.py',import.meta.url).pathname,raw,ready,String(minArea)],{encoding:'utf8',maxBuffer:1048576});if(r.status!==0)throw Error('瓦片几何处理失败：'+r.stderr);}
  let count=0,bytes=0;const decoded=[];
  for await(const line of createInterface({input:createReadStream(clean?ready:raw),crlfDelay:Infinity})){
   const tile=JSON.parse(line);if(!tile.features.length)continue;
