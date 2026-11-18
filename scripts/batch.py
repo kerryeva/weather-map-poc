@@ -3,7 +3,7 @@ from pathlib import Path
 from datetime import datetime,timezone
 import argparse,hashlib,json,os,re,shutil,signal,subprocess,sys,threading,time,traceback
 import requests
-from storage import PREFIX,Publisher,LocalStore,R2Store,SafetyStop,encoded,digests,shard_budget,retained_bytes
+from storage import PREFIX,Publisher,LocalStore,R2Store,SafetyStop,encoded,digests,shard_budget,retained_bytes,transient_error
 
 ROOT=Path(__file__).resolve().parents[1]
 from model_sources import BASE as SPATIAL,definition as product_definition,discover,model_plan,build_plan
@@ -33,8 +33,11 @@ def shard_leads(index,count):
     return FULL_LEADS[index*chunk:(index+1)*chunk]
 
 def public_error(error,mode):
-    """公开日志只保留可安全展示的原因：SafetyStop 的中文说明，或异常类型加 SDK 错误码。"""
-    code=getattr(error,'response',{}).get('Error',{}).get('Code','')
+    """公开日志只保留可安全展示的原因：SafetyStop 的中文说明，或异常类型加 SDK 错误码。
+
+    连接超时一类的 SDK 异常没有 response，这里必须容忍，否则报错格式化本身会把真实原因顶掉。
+    """
+    code=(getattr(error,'response',None) or {}).get('Error',{}).get('Code','')
     safe_code=code if isinstance(code,str) and re.fullmatch('[A-Za-z0-9_.-]{1,60}',code) else ''
     if isinstance(error,SafetyStop) or mode!='r2':return str(error)
     return type(error).__name__+(':'+safe_code if safe_code else '')
@@ -45,10 +48,14 @@ def stop_detail(error,mode):
     旧实现的未知异常只打印类型名，云端日志因此无法区分「渲染崩了」与「收尾写索引崩了」；
     这里对非 SDK 异常补上消息，SDK 异常仍按 public_error 脱敏。
     """
-    if isinstance(error,SafetyStop) or mode!='r2':return str(error) or type(error).__name__
-    if type(error).__module__.split('.')[0] in ('botocore','boto3'):return public_error(error,mode)
-    message=' '.join(str(error).split())[:200]
-    return f'{type(error).__name__}：{message}' if message else type(error).__name__
+    try:
+        if isinstance(error,SafetyStop) or mode!='r2':return str(error) or type(error).__name__
+        if type(error).__module__.split('.')[0] in ('botocore','boto3'):return public_error(error,mode)
+        message=' '.join(str(error).split())[:200]
+        return f'{type(error).__name__}：{message}' if message else type(error).__name__
+    except Exception:
+        # 诊断代码自己出错不能顶掉真实原因。
+        return type(error).__name__
 
 TRANSIENT_CODES=('InternalError','ServiceUnavailable','SlowDown','RequestTimeout','Throttling','RequestTimeTooSkewed','500','502','503','504')
 
@@ -58,11 +65,7 @@ def transient_storage_error(error):
     R2 偶发 InternalError 时，最合理的处理是稍后重试，而不是把已跑完的批次判红：
     发布对象按内容寻址，重试要么命中已有对象、要么补齐缺的那几个。
     """
-    if type(error).__module__.split('.')[0] not in ('botocore','boto3'):return False
-    response=getattr(error,'response',None) or {}
-    status=response.get('ResponseMetadata',{}).get('HTTPStatusCode',0) or 0
-    code=response.get('Error',{}).get('Code','')
-    return status>=500 or code in TRANSIENT_CODES
+    return transient_error(error)
 
 def error_frames(error,limit=8):
     """只暴露本仓库内的调用位置，用来从云端日志直接定位；不含参数、响应体与凭据。"""
@@ -510,6 +513,7 @@ def main():
                         'skipped':[row['lead'] for row in failures],'total':len(plan)}),flush=True)
                     times=None
                 if times:
+                    print(json.dumps({'status':'finishing','run_id':run_id,'times':len(times)},ensure_ascii=False),flush=True)
                     manifest={'run_id':run_id,'run':report['run'],'processing_sha256':fingerprint,'status':'complete',
                         'profile':args.profile,'times':[{'lead':t['lead'],'valid':t['valid'],'product_bytes':t['product_bytes']} for t in times],
                         'product_bytes':sum(t['product_bytes'] for t in times),'model':model,'attribution':f"Open-Meteo / {'ECMWF' if model=='IFS' else 'NOAA'}, CC BY 4.0"}

@@ -1,7 +1,7 @@
 """按时次预留空间；上传循环仅做整数计数，不逐文件远端扫描。"""
 from pathlib import Path,PurePosixPath
 from datetime import date,timedelta
-import base64,hashlib,json,os,re,shutil
+import base64,hashlib,json,os,re,shutil,time
 
 PREFIX='ifs-test-v1/'
 RUN_ID=re.compile(r'\d{10}-[a-f0-9]{12}')
@@ -13,6 +13,16 @@ BUDGET_WINDOW_DAYS=35
 
 class SafetyStop(RuntimeError):
     """保险丝触发：不得降级为成功、继续上传或自动扩大限制。"""
+
+TRANSIENT_CODES=('InternalError','ServiceUnavailable','SlowDown','RequestTimeout','Throttling','RequestTimeTooSkewed','500','502','503','504')
+
+def transient_error(error):
+    """存储服务的临时故障：5xx、限流，或连接/读取超时（这一类没有 HTTP 响应，按临时处理）。"""
+    if type(error).__module__.split('.')[0] not in ('botocore','boto3'):return False
+    response=getattr(error,'response',None)
+    if response is None:return True
+    status=response.get('ResponseMetadata',{}).get('HTTPStatusCode',0) or 0
+    return status>=500 or response.get('Error',{}).get('Code','') in TRANSIENT_CODES
 
 def retained_bytes(publisher,run_id):
     """本轮之外仍在桶里的字节（旧完整批）：分片预算必须先扣掉它，才能保证总量不越线。"""
@@ -167,11 +177,18 @@ class R2Store:
         return etag
 
     def delete(self,keys):
-        for start in range(0,len(keys),1000):
-            items=[{'Key':checked_key(key,self.prefix)} for key in keys[start:start+1000]]
-            self.requests['delete']+=1
-            response=self.client.delete_objects(Bucket=self.bucket,Delete={'Objects':items,'Quiet':True})
-            if response.get('Errors'):raise SafetyStop('旧测试批次清理不完整，禁止上传新批次')
+        # 每批 200 个：单请求越轻越不容易撞读取超时，失败按临时故障重试。
+        for start in range(0,len(keys),200):
+            items=[{'Key':checked_key(key,self.prefix)} for key in keys[start:start+200]]
+            for attempt in range(3):
+                self.requests['delete']+=1
+                try:
+                    response=self.client.delete_objects(Bucket=self.bucket,Delete={'Objects':items,'Quiet':True})
+                except Exception as error:
+                    if not transient_error(error) or attempt==2:raise
+                    time.sleep(2*(attempt+1));continue
+                if response.get('Errors'):raise SafetyStop('旧测试批次清理不完整，禁止上传新批次')
+                break
 
 class Publisher:
     def __init__(self,store,ceiling=CEILING_BYTES,reserve=HEADROOM_BYTES,budget=None):
@@ -234,13 +251,25 @@ class Publisher:
         self._check(new_run=run_id)
         self.remaining=METADATA_RESERVATION
 
-    def remove_other_runs(self,keep):
+    def remove_other_runs(self,keep,defer=False):
+        """回收旧批。defer=True 时遇到存储临时故障只记一笔、不判红：此时新批已发布，资料是完整的。"""
         folders=tuple(self.prefix+'runs/'+r+'/' for r in self.batches-keep)
-        if folders:
-            keys=[k for k in self.objects if k.startswith(folders)]
-            self.store.delete(keys)
-            self.refresh()
-            if self.batches-keep:raise SafetyStop('旧起报未清理完毕，须重试')
+        if not folders:return True
+        keys=[k for k in self.objects if k.startswith(folders)]
+        try:
+            self.store.delete(keys);self.refresh()
+        except Exception as error:
+            if not defer or not transient_error(error):raise
+            print(json.dumps({'status':'cleanup_deferred','pending':sorted(self.batches-keep),
+                'reason':type(error).__name__},ensure_ascii=False),flush=True)
+            return False
+        if self.batches-keep:
+            if defer:
+                print(json.dumps({'status':'cleanup_deferred','pending':sorted(self.batches-keep),
+                    'reason':'未清理完'},ensure_ascii=False),flush=True)
+                return False
+            raise SafetyStop('旧起报未清理完毕，须重试')
+        return True
 
     def reserve_time(self,files):
         # 每个时次只进行一次完整远端核对，后续每文件仅扣减本地预留额度。
@@ -308,7 +337,7 @@ class Publisher:
         self.put_json(self.prefix+'latest.json',manifest)
         self.latest=manifest
         # 两份在线目录都已切换，才能回收上一批。旧测试前缀沿用原保留规则。
-        if self.prefix!=PREFIX:self.remove_other_runs({self.target})
+        if self.prefix!=PREFIX:self.remove_other_runs({self.target},defer=True)
 
     def reserve_operations(self,day,writes):
         # 覆盖31天账期、批次开始预留至实际上传的跨日延迟，并额外保留余量。
