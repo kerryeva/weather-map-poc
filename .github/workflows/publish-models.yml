@@ -123,9 +123,10 @@ jobs:
                           targets.append({'model': model, 'shard': shard, 'total': 4,
                                           'processor': os.environ['GITHUB_SHA']})
           else:
-              # 手动触发是诊断入口，始终单任务跑全量，不受源站就绪判断影响。
+              # 手动触发同样按分片跑：33 个时次单任务约 5.7 小时，必然撞 main() 里的 5 小时上限。
               for model in ('IFS', 'GFS'):
-                  targets.append({'model': model, 'shard': 0, 'total': 1, 'processor': os.environ['GITHUB_SHA']})
+                  for shard in range(4):
+                      targets.append({'model': model, 'shard': shard, 'total': 4, 'processor': os.environ['GITHUB_SHA']})
           with open(os.environ['GITHUB_OUTPUT'], 'a') as out:
               print('targets=' + json.dumps(targets, separators=(',', ':')), file=out)
               print('count=' + str(len(targets)), file=out)
