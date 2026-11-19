@@ -560,11 +560,18 @@ def model_store(model,prefix):
         ('R2_ACCOUNT_ID','ACCOUNT_ID'),('AWS_ACCESS_KEY_ID','ACCESS_KEY_ID'),('AWS_SECRET_ACCESS_KEY','SECRET_ACCESS_KEY'))}
     return R2Store(os.environ.get(model+'_R2_BUCKET',''),prefix=prefix,credentials=credentials)
 
+# 只有真正决定瓦片字节的文件才进源指纹：run_id 由指纹派生，而客户端缓存键含 run_id，
+# 所以把「租约/清理/摘要」这类基础设施代码也算进来，会让一次无关提交把所有人的本地缓存作废。
+TILE_SOURCES=[('src',None),('scripts',{'extract.py','model_sources.py','regrid.mjs','render.mjs','render-pool.mjs','clean_tiles.py','pack_one.py'})]
+
 def source_fingerprint():
     digest=hashlib.sha256()
-    for folder,extensions in [('src',{'.mjs'}),('scripts',{'.py','.mjs'})]:
+    for folder,names in TILE_SOURCES:
         for path in sorted((ROOT/folder).iterdir()):
-            if path.suffix in extensions:digest.update(path.name.encode()+b'\0'+path.read_bytes())
+            if not path.is_file():continue
+            if names is not None and path.name not in names:continue
+            if names is None and path.suffix not in {'.mjs','.py'}:continue
+            digest.update(path.name.encode()+b'\0'+path.read_bytes())
     return digest.hexdigest()
 
 def wait_for_prepare(store,prefix,run_id,timeout=180,interval=5):
