@@ -16,7 +16,9 @@ export function lineContours(values,grid,interval){
   for(let k=0;k<PAD;k++){padded[row+k]=values[src+nx-PAD+k];padded[row+PAD+nx+k]=values[src+k];}
  }
  // 格点坐标：经度取格点值（lonMin + i*dx），纬度同理（latMin + j*dy）。
- const lonOf=x=>lonMin+(x-PAD)*dx,latOf=y=>latMin+y*dy;
+ // d3-contour 输出的坐标是"格子中心"约定：数组下标 i 对应的坐标是 i+0.5。
+ // 所以要先减掉 0.5 再减掉补边列数，才是真正的格点位置，否则整层会偏半格（0.125°）。
+ const lonOf=x=>lonMin+(x-PAD-.5)*dx,latOf=y=>latMin+(y-.5)*dy;
  const levels=[];for(let v=Math.ceil(min/interval)*interval;v<=max;v+=interval)levels.push(v);
  const features=[],cleanup={duplicate_points_removed:0,zero_length_parts_removed:0};
  for(const contour of contours().size([width,ny]).thresholds(levels).smooth(true)(padded))for(const polygon of contour.coordinates)for(const ring of polygon){

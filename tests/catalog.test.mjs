@@ -95,3 +95,14 @@ test('CAPE 五档色标：500 以下不生成，2500 及以上共用端色',()=>
   assert.ok(geo.features.length);
   assert.ok(geo.features.every(f=>f.properties.capeScaleVersion===3));
 });
+
+test('等值线坐标落在真实格点上，不偏半格',()=>{
+  // 场值就是纬度本身，所以每条 10° 间隔的等值线应当精确落在 -80…80。
+  const grid={nx:1440,ny:721,lonMin:-180,latMin:-90,dx:.25,dy:.25};
+  const values=new Float64Array(grid.nx*grid.ny);
+  for(let y=0;y<grid.ny;y++)for(let x=0;x<grid.nx;x++)values[y*grid.nx+x]=grid.latMin+y*grid.dy;
+  const result=lineContours(values,grid,10);
+  const lats=result.features.flatMap(f=>f.geometry.coordinates.map(p=>p[1]));
+  assert.ok(lats.length>0);
+  for(const lat of lats)assert.ok(Math.abs(lat/10-Math.round(lat/10))<1e-9,'纬度偏了半格：'+lat);
+});
