@@ -131,6 +131,39 @@ jobs:
               print('targets=' + json.dumps(targets, separators=(',', ':')), file=out)
               print('count=' + str(len(targets)), file=out)
           PY
+      - name: Install prepare dependencies
+        if: env.SCOPE == 'full'
+        run: python -m pip install --disable-pip-version-check requests==2.32.3 boto3==1.44.3
+      - name: Prepare manual batch
+        if: env.SCOPE == 'full'
+        env:
+          IFS_R2_ACCOUNT_ID: ${{ secrets.IFS_R2_ACCOUNT_ID }}
+          GFS_R2_ACCOUNT_ID: ${{ secrets.GFS_R2_ACCOUNT_ID }}
+          IFS_BUCKET: ${{ secrets.IFS_R2_BUCKET }}
+          IFS_KEY: ${{ secrets.IFS_R2_ACCESS_KEY_ID }}
+          IFS_SECRET: ${{ secrets.IFS_R2_SECRET_ACCESS_KEY }}
+          GFS_BUCKET: ${{ secrets.GFS_R2_BUCKET }}
+          GFS_KEY: ${{ secrets.GFS_R2_ACCESS_KEY_ID }}
+          GFS_SECRET: ${{ secrets.GFS_R2_SECRET_ACCESS_KEY }}
+        shell: bash
+        run: |
+          # 手动 full 也走「0 号分片准备 + 其余分片等待」的流程，否则分片之间没有协调者。
+          prepare() {
+            model="$1"
+            case "$model" in
+              IFS) bucket="$IFS_BUCKET"; key="$IFS_KEY"; secret="$IFS_SECRET" ;;
+              GFS) bucket="$GFS_BUCKET"; key="$GFS_KEY"; secret="$GFS_SECRET" ;;
+            esac
+            export MODEL="$model" PROCESSOR_COMMIT="$GITHUB_SHA"
+            export TARGET_BUCKET="$bucket" TARGET_KEY="$key" TARGET_SECRET="$secret"
+            export "${model}_R2_BUCKET=$bucket" "${model}_R2_ACCESS_KEY_ID=$key" "${model}_R2_SECRET_ACCESS_KEY=$secret"
+            python scripts/batch.py --model "$MODEL" --profile full --leads all --mode r2 \
+              --shard 0/4 --prepare-only --product-workers 4 \
+              --work "$RUNNER_TEMP/work" --report "$RUNNER_TEMP/report/run.json"
+          }
+          # 某个模式没有可发布的新资料时不要拖垮另一个模式；对应分片会等在 3 分钟内失败，不会挂 5 小时。
+          prepare IFS || echo 'IFS 准备失败，跳过'
+          prepare GFS || echo 'GFS 准备失败，跳过'
       - name: Upload scheduled metadata
         if: env.SCOPE == 'auto' && steps.plan.outputs.count != '0'
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
@@ -212,10 +245,13 @@ jobs:
         shell: bash
         run: |
           export "${MODEL}_R2_BUCKET=$TARGET_BUCKET" "${MODEL}_R2_ACCESS_KEY_ID=$TARGET_KEY" "${MODEL}_R2_SECRET_ACCESS_KEY=$TARGET_SECRET"
+          # full 走分片：没有 --shard 的话四个 job 会抢同一把全局租约，
+          # 只有一个能跑，而且要独自跑完 33 个时次（约 5.8 小时），必然撞上 5 小时上限。
+          shard_args=()
           case "$SCOPE" in
             height) profile=500hpa; leads=0 ;;
-            full) profile=full; leads=all ;;
+            full) profile=full; leads=all; shard_args=(--shard "$SHARD" --skip-prepare) ;;
             *) exit 2 ;;
           esac
           python scripts/batch.py --model "$MODEL" --profile "$profile" --leads "$leads" --mode r2 \
-            --product-workers 4 --work "$RUNNER_TEMP/work" --report "$RUNNER_TEMP/report/run.json"
+            "${shard_args[@]}" --product-workers 4 --work "$RUNNER_TEMP/work" --report "$RUNNER_TEMP/report/run.json"
