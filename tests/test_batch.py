@@ -508,5 +508,35 @@ class Fingerprint(unittest.TestCase):
             finally:
                 batch_module.ROOT, batch_module.TILE_SOURCES = orig_root,orig_tile
 
+
+class LeaseWait(unittest.TestCase):
+    """分片同时启动时，后来者应当短暂等待而不是立刻失败。"""
+
+    def test_waits_for_transient_lease_conflict(self):
+        calls={'n':0}
+        def fake(store,shard=None):
+            calls['n']+=1
+            if calls['n']<3: raise batch_module.SafetyStop('已有生产任务持有未到期写入租约')
+            return 'token'
+        original,original_retry=batch_module.acquire_lease,batch_module.LEASE_RETRY_SECONDS
+        batch_module.acquire_lease=fake
+        batch_module.LEASE_RETRY_SECONDS=0.01
+        try:
+            self.assertEqual(batch_module.acquire_lease_wait(None,None,wait_seconds=5),'token')
+            self.assertEqual(calls['n'],3)
+        finally:
+            batch_module.acquire_lease,batch_module.LEASE_RETRY_SECONDS=original,original_retry
+
+    def test_other_safety_stop_raises_immediately(self):
+        def fake(store,shard=None):
+            raise batch_module.SafetyStop('容量余量不足，禁止分片发布')
+        original=batch_module.acquire_lease
+        batch_module.acquire_lease=fake
+        try:
+            with self.assertRaises(batch_module.SafetyStop):
+                batch_module.acquire_lease_wait(None,None,wait_seconds=5)
+        finally:
+            batch_module.acquire_lease=original
+
 if __name__=='__main__':unittest.main()
 

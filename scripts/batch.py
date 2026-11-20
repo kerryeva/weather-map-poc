@@ -364,7 +364,7 @@ def main():
                     store=model_store(model,prefix)
                 else:
                     store=R2Store(args.bucket)
-                lease=acquire_lease(store,shard)
+                lease=acquire_lease_wait(store,shard)
                 if not isinstance(lease,LocalStore):
                     heartbeat=LeaseHeartbeat(store,lease,key=lease_key(shard)).start()
                     # 取消时先走 finally 释放租约，而不是留下长时间的空锁。
@@ -585,6 +585,9 @@ def wait_for_prepare(store,prefix,run_id,timeout=180,interval=5):
 
 LEASE_SECONDS=1800
 LEASE_RENEW_SECONDS=600
+# 分片几乎同时启动，先到者正常持锁；后来者短暂等一会儿，而不是立刻判失败。
+LEASE_WAIT_SECONDS=90
+LEASE_RETRY_SECONDS=10
 
 LOCK_NAME='writer-lock.json'
 LOCK_SHARDS=16
@@ -666,6 +669,22 @@ def acquire_lease(store,shard=None):
     except ClientError as error:
         raise SafetyStop('未能独占生产租约，禁止并发上传') from error
     return token
+
+def acquire_lease_wait(store,shard=None,wait_seconds=None):
+    """抢不到写入租约时短暂重试：同一模型的 4 个分片同时启动属于正常竞争，不该直接失败。
+    只有租约冲突才重试，其他 SafetyStop（容量不足、时间上限等）立刻抛出。"""
+    wait=LEASE_WAIT_SECONDS if wait_seconds is None else wait_seconds
+    deadline=time.monotonic()+max(0,float(wait));announced=False
+    while True:
+        try:
+            return acquire_lease(store,shard)
+        except SafetyStop as error:
+            text=str(error)
+            if not any(word in text for word in ('租约','写入锁')) or time.monotonic()>=deadline:
+                raise
+            if not announced:
+                print(f'写入租约被占用，最多等待 {int(max(0,float(wait)))} 秒：{text}',flush=True);announced=True
+            time.sleep(min(LEASE_RETRY_SECONDS,max(0.5,deadline-time.monotonic())))
 
 def release_lease(store,lease,shard=None,attempts=3):
     if isinstance(store,LocalStore):lease.close();return
