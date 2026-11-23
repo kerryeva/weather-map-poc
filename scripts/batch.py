@@ -3,7 +3,7 @@ from pathlib import Path
 from datetime import datetime,timezone
 import argparse,hashlib,json,os,re,shutil,signal,subprocess,sys,threading,time,traceback
 import requests
-from storage import PREFIX,Publisher,LocalStore,R2Store,SafetyStop,encoded,digests,shard_budget,retained_bytes,transient_error
+from storage import PREFIX,Publisher,LocalStore,R2Store,SafetyStop,encoded,digests,shard_budget,retained_bytes,transient_error,reserved_class_a
 
 ROOT=Path(__file__).resolve().parents[1]
 from model_sources import BASE as SPATIAL,definition as product_definition,discover,model_plan,build_plan
@@ -381,9 +381,7 @@ def main():
                 if publisher.latest and publisher.latest['run']>report['run']:
                     raise SafetyStop('不允许以旧起报覆盖更新的完整资料')
                 # ListObjects 属于A类，不可把所有读取都算作B类。按可能的分页数保守预留。
-                max_objects=len(publisher.objects)+(len(definition['products'])+1)*len(plan)+20
-                max_pages=max(1,(max_objects+999)//1000)
-                reserved_a=2*(len(definition['products'])*len(plan)+len(plan)*2+30+(len(plan)+4)*max_pages)
+                reserved_a=reserved_class_a(len(definition['products']),len(plan),len(publisher.objects))
                 publisher.reserve_operations(datetime.now(UTC).date().isoformat(),reserved_a)
                 if args.skip_prepare:
                     # 旧批次只由 0 号分片清理；其余分片先等它写出准备标记，绝不删除他人成果。
@@ -499,8 +497,13 @@ def main():
             if publisher:
                 times=list(report['times']);expected=[t['lead'] for t in plan]
                 if shard:
+                    shared=publisher.store.read_json(prefix+'available.json')
+                    if not shared or shared.get('run_id')!=run_id:raise SafetyStop('当前可用时次目录已切换起报')
+                    publisher.available=shared
                     covered={row['lead'] for row in publisher.available['times']}
-                    if covered!=set(FULL_LEADS):
+                    if shared.get('complete'):
+                        times=None
+                    elif covered!=set(FULL_LEADS):
                         # 其他分片还没写完，本轮先不写完整批次索引，等最后一片收尾。
                         print(json.dumps({'shard':args.shard,'status':'waiting_other_shards','covered':len(covered),'total':len(FULL_LEADS)}),flush=True)
                         times=None;expected=FULL_LEADS
@@ -520,7 +523,7 @@ def main():
                     publisher.finish_run(manifest,expected)
                 report['store']={'observed_peak_bytes':publisher.peak_bytes,'final_tracked_bytes':publisher.current_bytes,
                     'batch_count':len(publisher.batches),'application_requests':publisher.store.requests,
-                    'note':'SDK 自动重试次数不在 application_requests 中；A 类预算按每次调用最多两次尝试预留。'}
+                    'note':'application_requests 统计 SDK 调用；A 类普通调用最多两次请求，控制清单更新最多六次条件写入。'}
             report['status']='complete' if complete else 'incomplete'
             skipped=('｜跳过：'+','.join(f"F{row['lead']:03d}" for row in failures)) if failures else ''
             step_summary(['### 制图完成' if complete else '### 制图部分完成','',f"- 模式：{model}｜起报：{report['run']}",
@@ -656,7 +659,7 @@ def acquire_lease(store,shard=None):
         return stream
     from botocore.exceptions import ClientError
     try:
-        store.requests['get']+=1;response=store.client.get_object(Bucket=store.bucket,Key=key)
+        store.requests['get']+=1;response=store.read_client.get_object(Bucket=store.bucket,Key=key)
         with response['Body'] as body:previous=json.loads(body.read())
         if previous['expires']>time.time():raise SafetyStop('已有生产任务持有未到期写入租约')
         condition={'IfMatch':response['ETag']}

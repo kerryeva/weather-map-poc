@@ -1,7 +1,7 @@
 """按时次预留空间；上传循环仅做整数计数，不逐文件远端扫描。"""
 from pathlib import Path,PurePosixPath
 from datetime import date,timedelta
-import base64,hashlib,json,os,re,shutil,time
+import base64,hashlib,json,os,random,re,shutil,time
 
 PREFIX='ifs-test-v1/'
 RUN_ID=re.compile(r'\d{10}-[a-f0-9]{12}')
@@ -10,9 +10,18 @@ CEILING_BYTES=9_600_000_000
 HEADROOM_BYTES=256_000_000
 METADATA_RESERVATION=2_000_000
 BUDGET_WINDOW_DAYS=35
+CLASS_A_ATTEMPTS=2
+CONDITIONAL_WRITE_ATTEMPTS=6
+UNCONDITIONAL=object()
 
 class SafetyStop(RuntimeError):
     """保险丝触发：不得降级为成功、继续上传或自动扩大限制。"""
+
+class WriteConflict(Exception):
+    """对象在读取后被其他写入者更新。"""
+
+class WriteThrottled(Exception):
+    """R2 对控制清单的条件写入限流。"""
 
 TRANSIENT_CODES=('InternalError','ServiceUnavailable','SlowDown','RequestTimeout','Throttling','RequestTimeTooSkewed','500','502','503','504')
 
@@ -41,6 +50,14 @@ def shard_budget(shard_count,retained_bytes=0):
     available=CEILING_BYTES-HEADROOM_BYTES-retained_bytes-metadata
     if available<=0:raise SafetyStop('容量余量不足，禁止分片发布')
     return available//shard_count
+
+def reserved_class_a(products,times,listed_objects):
+    max_objects=listed_objects+(products+1)*times+20
+    max_pages=max(1,(max_objects+999)//1000)
+    # 每时次更新一次可用目录，另给操作账本和批次完成各一次条件更新。
+    conditional=times+2
+    ordinary=products*times+times+28+(times+4)*max_pages
+    return ordinary*CLASS_A_ATTEMPTS+conditional*CONDITIONAL_WRITE_ATTEMPTS
 
 def encoded(value):
     return (json.dumps(value,ensure_ascii=False,separators=(',',':'))+'\n').encode()
@@ -91,19 +108,33 @@ class LocalStore:
         return result
 
     def read_json(self,key):
-        self.requests['get']+=1;path=self._path(key)
-        if not path.exists():return None
-        if path.stat().st_size>2_000_000:raise SafetyStop('控制清单过大，禁止继续处理')
-        return json.loads(path.read_text())
+        return self.read_json_version(key)[0]
 
-    def put(self,key,payload,immutable=False):
+    def read_json_version(self,key):
+        self.requests['get']+=1;path=self._path(key)
+        try:
+            with path.open('rb') as stream:data=stream.read(2_000_001)
+        except FileNotFoundError:return None,None
+        if len(data)>2_000_000:raise SafetyStop('控制清单过大，禁止继续处理')
+        return json.loads(data),hashlib.md5(data).hexdigest()
+
+    def put(self,key,payload,immutable=False,expected=UNCONDITIONAL):
+        import fcntl
         self.requests['put']+=1;path=self._path(key);path.parent.mkdir(parents=True,exist_ok=True)
         data=payload.read_bytes() if isinstance(payload,Path) else payload
-        if immutable and path.exists():
-            if path.read_bytes()!=data:raise SafetyStop('不可覆盖已存在的不同成品')
-            return hashlib.md5(data).hexdigest()
-        temp=path.with_name(path.name+'.uploading');temp.write_bytes(data);temp.replace(path)
-        return hashlib.md5(data).hexdigest()
+        etag=hashlib.md5(data).hexdigest()
+        lock=os.open(self.root,os.O_RDONLY)
+        try:
+            fcntl.flock(lock,fcntl.LOCK_EX)
+            if expected is not UNCONDITIONAL:
+                current=digests(path)[1] if path.exists() else None
+                if current!=expected:raise WriteConflict(key)
+            if immutable and path.exists():
+                if path.read_bytes()!=data:raise SafetyStop('不可覆盖已存在的不同成品')
+                return etag
+            temp=path.with_name(path.name+'.uploading');temp.write_bytes(data);temp.replace(path)
+            return etag
+        finally:os.close(lock)
 
     def delete(self,keys):
         for key in keys:
@@ -121,11 +152,16 @@ class R2Store:
             raise SafetyStop('缺少有效的 R2 账户或桶配置')
         if not credentials.get('AWS_ACCESS_KEY_ID') or not credentials.get('AWS_SECRET_ACCESS_KEY'):
             raise SafetyStop('缺少受限的 R2 读写凭据；不使用匿名或公开访问替代')
-        self.client=boto3.client('s3',endpoint_url=f'https://{account}.r2.cloudflarestorage.com',
-            aws_access_key_id=credentials['AWS_ACCESS_KEY_ID'],aws_secret_access_key=credentials['AWS_SECRET_ACCESS_KEY'],
-            region_name='auto',config=Config(retries={'total_max_attempts':5,'mode':'standard'},
-            connect_timeout=15,read_timeout=90,request_checksum_calculation='when_required',
-            response_checksum_validation='when_required'))
+        def client(attempts):
+            return boto3.client('s3',endpoint_url=f'https://{account}.r2.cloudflarestorage.com',
+                aws_access_key_id=credentials['AWS_ACCESS_KEY_ID'],aws_secret_access_key=credentials['AWS_SECRET_ACCESS_KEY'],
+                region_name='auto',config=Config(retries={'total_max_attempts':attempts,'mode':'standard'},
+                connect_timeout=15,read_timeout=90,request_checksum_calculation='when_required',
+                response_checksum_validation='when_required'))
+        self.client=client(CLASS_A_ATTEMPTS)
+        self.read_client=client(5)
+        # 外层每轮发一次 PUT，冲突和限流共用同一预算。
+        self.conditional_client=client(1)
 
     def list(self):
         result={};token=None;seen=set();pages=0
@@ -144,20 +180,23 @@ class R2Store:
             seen.add(token)
 
     def read_json(self,key):
+        return self.read_json_version(key)[0]
+
+    def read_json_version(self,key):
         from botocore.exceptions import ClientError
         self.requests['get']+=1
         try:
-            response=self.client.get_object(Bucket=self.bucket,Key=checked_key(key,self.prefix))
+            response=self.read_client.get_object(Bucket=self.bucket,Key=checked_key(key,self.prefix))
         except ClientError as error:
-            if error.response['Error']['Code'] in ('NoSuchKey','404'):return None
+            if error.response['Error']['Code'] in ('NoSuchKey','404'):return None,None
             raise
         with response['Body'] as body:
             if response.get('ContentLength',2_000_001)>2_000_000:raise SafetyStop('控制清单过大，禁止继续处理')
             data=body.read(2_000_001)
             if len(data)>2_000_000:raise SafetyStop('控制清单长度异常')
-            return json.loads(data)
+            return json.loads(data),response.get('ETag')
 
-    def put(self,key,payload,immutable=False):
+    def put(self,key,payload,immutable=False,expected=UNCONDITIONAL):
         from botocore.exceptions import ClientError
         key=checked_key(key,self.prefix);data=payload.read_bytes() if isinstance(payload,Path) else payload
         # 单成品最多 512 MB；不用分段上传，避免未完成分段累积和额外 A 操作。
@@ -166,10 +205,20 @@ class R2Store:
         args={'Bucket':self.bucket,'Key':key,'Body':data,'ContentLength':len(data),
               'ContentMD5':base64.b64encode(md5).decode(),'ContentType':'application/json' if key.endswith('.json') else 'application/octet-stream',
               'StorageClass':'STANDARD'}
-        if immutable:args['IfNoneMatch']='*'
-        try:response=self.client.put_object(**args)
+        if immutable or expected is None:args['IfNoneMatch']='*'
+        elif expected is not UNCONDITIONAL:args['IfMatch']=expected
+        conditional=expected is not UNCONDITIONAL
+        client=self.conditional_client if conditional else self.client
+        try:response=client.put_object(**args)
         except ClientError as error:
-            if error.response['Error']['Code'] in ('PreconditionFailed','412'):
+            code=error.response['Error']['Code']
+            status=error.response.get('ResponseMetadata',{}).get('HTTPStatusCode')
+            if conditional:
+                if status==429 or code in ('429','SlowDown','Throttling','ThrottlingException','TooManyRequests','TooManyRequestsException'):
+                    raise WriteThrottled(key) from error
+                if status==412 or code in ('PreconditionFailed','412','ConditionalRequestConflict','409'):
+                    raise WriteConflict(key) from error
+            if code in ('PreconditionFailed','412'):
                 raise SafetyStop('对象已由其他任务写入，禁止覆盖') from error
             raise
         etag=response.get('ETag','').strip('"')
@@ -280,7 +329,7 @@ class Publisher:
         self._check(additional=required,new_run=self.target)
         self.remaining=required
 
-    def put(self,key,payload,immutable=False):
+    def put(self,key,payload,immutable=False,expected=UNCONDITIONAL):
         checked_key(key,self.prefix);size=payload.stat().st_size if isinstance(payload,Path) else len(payload)
         previous=self.objects.get(key,{}).get('bytes',0);extra=max(0,size-previous)
         if extra>self.remaining:raise SafetyStop('上传量超过本时次预留空间')
@@ -290,7 +339,11 @@ class Publisher:
         # 不再查询远端。此检查只有整数运算和少量批次名集合操作。
         new_run=self.target if self.target and key.startswith(self.prefix+f'runs/{self.target}/') else None
         self._check(additional=extra,new_run=new_run)
-        etag=self.store.put(key,payload,immutable=immutable);self.remaining-=extra;self.written+=extra
+        if expected is UNCONDITIONAL:
+            etag=self.store.put(key,payload,immutable=immutable)
+        else:
+            etag=self.store.put(key,payload,expected=expected)
+        self.remaining-=extra;self.written+=extra
         self.objects[key]={'bytes':size,'etag':etag};self.current_bytes+=size-previous
         if key.startswith(self.prefix+'runs/'):self.batches.add(key[len(self.prefix+'runs/'):].split('/')[0])
         self.peak_bytes=max(self.peak_bytes,self._check())
@@ -298,6 +351,27 @@ class Publisher:
 
     def put_json(self,key,value):
         return self.put(key,encoded(value))
+
+    def update_json(self,key,update):
+        throttled=0
+        for attempt in range(CONDITIONAL_WRITE_ATTEMPTS):
+            current,etag=self.store.read_json_version(key)
+            if current is not None and not etag:raise SafetyStop('控制清单缺少对象版本')
+            value=update(current)
+            if value==current:return current
+            try:
+                self.put(key,encoded(value),expected=etag)
+                return value
+            except (WriteConflict,WriteThrottled) as error:
+                if attempt+1==CONDITIONAL_WRITE_ATTEMPTS:
+                    message='R2 持续限流，暂缓写入控制清单' if isinstance(error,WriteThrottled) else '控制清单并发写入未收敛'
+                    raise SafetyStop(message) from error
+                if isinstance(error,WriteThrottled):
+                    delay=min(16,2**throttled)
+                    throttled+=1
+                else:
+                    delay=min(2,.2*2**attempt)
+                time.sleep(delay+random.uniform(0,.2))
 
     def matches(self,key,size,md5):
         return self.objects.get(key)=={'bytes':size,'etag':md5}
@@ -311,19 +385,14 @@ class Publisher:
         if key not in self.objects:raise SafetyStop('时次清单尚未提交，禁止提前开放')
         item={'lead':manifest['lead'],'valid':manifest['valid'],'manifest_key':key,
             'product_bytes':manifest['product_bytes'],'verified_products':len(rows)}
-        # 分片并发写同一对象：先读远端再合并，写完回读确认，避免后写覆盖前写的时次。
-        for _attempt in range(3):
-            remote=self.store.read_json(self.prefix+'available.json')
-            base=remote if remote and remote.get('run_id')==self.available['run_id'] else self.available
-            times={row['lead']:row for row in base.get('times',[])};times[item['lead']]=item
-            merged={**base,'model':manifest.get('model'),'run':manifest.get('run'),'processing_sha256':manifest.get('processing_sha256'),
+        def merge(remote):
+            if not remote or remote.get('run_id')!=self.target:
+                raise SafetyStop('当前可用时次目录已切换起报')
+            if remote.get('complete'):return remote
+            times={row['lead']:row for row in remote.get('times',[])};times[item['lead']]=item
+            return {**remote,'model':manifest.get('model'),'run':manifest.get('run'),'processing_sha256':manifest.get('processing_sha256'),
                 'profile':manifest.get('profile'),'times':sorted(times.values(),key=lambda x:x['lead'])}
-            self.put_json(self.prefix+'available.json',merged)
-            check=self.store.read_json(self.prefix+'available.json')
-            if check and {row['lead'] for row in check.get('times',[])}>=set(times):
-                self.available=merged;break
-        else:
-            raise SafetyStop('可用目录并发写入未收敛')
+        self.available=self.update_json(self.prefix+'available.json',merge)
 
     def finish_run(self,manifest,expected_leads):
         if manifest['run_id']!=self.target or self.available['run_id']!=self.target or manifest['status']!='complete':
@@ -331,9 +400,11 @@ class Publisher:
         if {r['lead'] for r in self.available['times']}!=set(expected_leads):
             raise SafetyStop('可用时次未覆盖请求范围，不能标记整批完成')
         self.put_json(self.prefix+f'runs/{self.target}/manifest.json',manifest)
-        self.available={**self.available,'complete':True}
-        if self.prefix!=PREFIX:self.available['fallback_run_id']=None
-        self.put_json(self.prefix+'available.json',self.available)
+        def complete(remote):
+            if not remote or remote.get('run_id')!=self.target or {r['lead'] for r in remote['times']}!=set(expected_leads):
+                raise SafetyStop('可用时次目录已变更，不能标记整批完成')
+            return {**remote,'complete':True,**({'fallback_run_id':None} if self.prefix!=PREFIX else {})}
+        self.available=self.update_json(self.prefix+'available.json',complete)
         self.put_json(self.prefix+'latest.json',manifest)
         self.latest=manifest
         # 两份在线目录都已切换，才能回收上一批。旧测试前缀沿用原保留规则。
@@ -345,7 +416,10 @@ class Publisher:
         except (TypeError,ValueError):raise SafetyStop('操作预算日期无效')
         if today.isoformat()!=day:raise SafetyStop('操作预算日期必须为YYYY-MM-DD')
         if type(writes) is not int or writes<0:raise SafetyStop('操作预留无效')
-        key=PREFIX+'budgets/rolling-operations.json';ledger=self.store.read_json(key)
+        key=PREFIX+'budgets/rolling-operations.json'
+        self.update_json(key,lambda ledger:self._operation_ledger(today,day,writes,ledger))
+
+    def _operation_ledger(self,today,day,writes,ledger):
         cutoff=today-timedelta(days=BUDGET_WINDOW_DAYS-1)
         if ledger is None:
             # 旧月账本无法还原逐日用量，首次升级将相关月份的全部预留保守计入今天。
@@ -377,4 +451,4 @@ class Publisher:
         if sum(days.values())+writes>800_000:
             raise SafetyStop('上传操作保险丝：滚动35天预留A类操作将超过80万次')
         days[day]=days.get(day,0)+writes
-        self.put_json(key,{'version':1,'window_days':BUDGET_WINDOW_DAYS,'as_of':day,'days':days})
+        return {'version':1,'window_days':BUDGET_WINDOW_DAYS,'as_of':day,'days':days}

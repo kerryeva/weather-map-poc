@@ -1,5 +1,7 @@
 import json,os,sys,tempfile,time,unittest
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from threading import Barrier
 sys.path.insert(0,str(Path(__file__).resolve().parents[1]/'scripts'))
 from storage import LocalStore,Publisher,SafetyStop,PREFIX,OWNER,encoded,run_ids,shard_budget,retained_bytes,CEILING_BYTES,HEADROOM_BYTES,METADATA_RESERVATION,transient_error
 from batch import execute,build_plan,acquire_lease,release_lease,valid_time_manifest,download,public_error,stop_detail,error_frames,step_summary,shard_leads,FULL_LEADS,wait_for_prepare,LeaseHeartbeat,LEASE_SECONDS,LEASE_RENEW_SECONDS,execute_stage,StageTimeout,StageFailure,MAX_SKIPS,STAGE_BUDGETS,STAGE_RETRY_FACTOR,TIMESTEP_BUDGET,lease_key,lease_keys,active_lease,active_leases,foreign_leases,LOCK_SHARDS,retry_skipped,transient_storage_error
@@ -110,6 +112,36 @@ class Fuses(unittest.TestCase):
         complete={'run_id':run_key(1),'status':'complete'}
         with self.assertRaises(SafetyStop):publisher.finish_run(complete,[3,6])
         publisher.finish_run(complete,[3]);self.assertTrue(self.store.read_json(PREFIX+'available.json')['complete'])
+
+    def test_concurrent_shards_preserve_both_times_and_skip_duplicate_write(self):
+        import hashlib
+        publisher=Publisher(self.store,reserve=0);publisher.prepare(run_key(1))
+        manifests=[]
+        for lead in [3,6]:
+            key=object_key(1,f'F{lead:03}/product.pmtiles');data=b'verified-product'
+            publisher.put(key,data,immutable=True)
+            manifest={'lead':lead,'valid':f'2026-11-13T{lead:02}:00:00Z','product_bytes':len(data),
+                'products':[{'status':'verified','object_key':key,'bytes':len(data),'md5':hashlib.md5(data).hexdigest()}]}
+            publisher.put_json(object_key(1,f'F{lead:03}/manifest.json'),manifest)
+            manifests.append(manifest)
+        shards=[Publisher(LocalStore(self.store.root),reserve=0) for _ in manifests]
+        barrier=Barrier(2)
+        def publish(shard,manifest):
+            read_version=shard.store.read_json_version
+            def read(key):
+                result=read_version(key)
+                if not result[0]['times']:barrier.wait(timeout=5)
+                return result
+            shard.store.read_json_version=read
+            shard.target=run_key(1)
+            shard.publish_time(manifest)
+        with patch('storage.time.sleep'),ThreadPoolExecutor(max_workers=2) as threads:
+            jobs=[threads.submit(publish,s,m) for s,m in zip(shards,manifests)]
+            for job in jobs:job.result()
+        available=self.store.read_json(PREFIX+'available.json')
+        self.assertEqual([row['lead'] for row in available['times']],[3,6])
+        before=publisher.store.requests['put'];publisher.publish_time(manifests[0])
+        self.assertEqual(publisher.store.requests['put'],before)
 
 class Plan(unittest.TestCase):
     def test_empty_or_incomplete_resume_manifest_cannot_skip_processing(self):
