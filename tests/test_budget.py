@@ -3,9 +3,9 @@ import json,sys,tempfile,unittest
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from threading import Barrier
-from unittest.mock import patch
+from unittest.mock import DEFAULT,patch
 sys.path.insert(0,str(Path(__file__).resolve().parents[1]/'scripts'))
-from storage import Publisher,LocalStore,PREFIX,METADATA_RESERVATION,SafetyStop,reserved_class_a
+from storage import Publisher,LocalStore,PREFIX,METADATA_RESERVATION,SafetyStop,WriteUncertain,reserved_class_a
 
 class RollingBudget(unittest.TestCase):
  def setUp(self):
@@ -75,5 +75,36 @@ class RollingBudget(unittest.TestCase):
  def test_corrupt_total_cannot_be_hidden_by_expiring_old_days(self):
   self.store.put(PREFIX+'budgets/rolling-operations.json',json.dumps({'version':1,'window_days':35,'as_of':'2026-12-01','days':{'2026-11-30':500_000,'2026-12-01':400_000}}).encode())
   with self.assertRaises(SafetyStop):self.publisher.reserve_operations('2027-02-01',1)
+
+ def test_lost_confirmation_after_reserving_does_not_charge_twice(self):
+  day='2026-11-23'
+  other=Publisher(LocalStore(self.folder.name),reserve=0)
+  put=self.store.put
+  def commit_then_timeout(*args,**kwargs):
+   put(*args,**kwargs)
+   other.reserve_operations(day,150)
+   raise WriteUncertain('response lost')
+  with patch.object(self.store,'put',side_effect=commit_then_timeout) as send,patch('storage.time.sleep'):
+   self.publisher.reserve_operations(day,250)
+  self.assertEqual(send.call_count,1)
+  self.assertEqual(self.ledger()['days'],{day:400})
+
+ def test_timeout_before_commit_retries_only_while_budget_ledger_is_unchanged(self):
+  day='2026-11-23';put=self.store.put
+  with patch.object(self.store,'put',wraps=put,side_effect=[WriteUncertain('response lost'),DEFAULT]) as send,patch('storage.time.sleep'):
+   self.publisher.reserve_operations(day,250)
+  self.assertEqual(send.call_count,2)
+  self.assertEqual(self.ledger()['days'],{day:250})
+
+ def test_ambiguous_commit_and_changed_ledger_without_receipt_fail_closed(self):
+  day='2026-11-23';other=Publisher(LocalStore(self.folder.name),reserve=0)
+  def change_then_timeout(*args,**kwargs):
+   other.reserve_operations(day,150)
+   raise WriteUncertain('response lost')
+  with patch.object(self.store,'put',side_effect=change_then_timeout) as send,patch('storage.time.sleep'):
+   with self.assertRaisesRegex(SafetyStop,'无法确认上一笔预留'):
+    self.publisher.reserve_operations(day,250)
+  self.assertEqual(send.call_count,1)
+  self.assertEqual(self.ledger()['days'],{day:150})
 
 if __name__=='__main__':unittest.main()

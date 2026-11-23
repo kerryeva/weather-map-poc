@@ -2,6 +2,7 @@
 from pathlib import Path,PurePosixPath
 from datetime import date,timedelta
 import base64,hashlib,json,os,random,re,shutil,time
+from uuid import uuid4
 
 PREFIX='ifs-test-v1/'
 RUN_ID=re.compile(r'\d{10}-[a-f0-9]{12}')
@@ -12,6 +13,7 @@ METADATA_RESERVATION=2_000_000
 BUDGET_WINDOW_DAYS=35
 CLASS_A_ATTEMPTS=2
 CONDITIONAL_WRITE_ATTEMPTS=6
+RECENT_RESERVATIONS=16
 UNCONDITIONAL=object()
 
 class SafetyStop(RuntimeError):
@@ -22,6 +24,9 @@ class WriteConflict(Exception):
 
 class WriteThrottled(Exception):
     """R2 对控制清单的条件写入限流。"""
+
+class WriteUncertain(Exception):
+    """R2 可能已完成条件写入，但没有确认结果。"""
 
 TRANSIENT_CODES=('InternalError','ServiceUnavailable','SlowDown','RequestTimeout','Throttling','RequestTimeTooSkewed','500','502','503','504')
 
@@ -197,7 +202,7 @@ class R2Store:
             return json.loads(data),response.get('ETag')
 
     def put(self,key,payload,immutable=False,expected=UNCONDITIONAL):
-        from botocore.exceptions import ClientError
+        from botocore.exceptions import ClientError,ConnectionError,HTTPClientError
         key=checked_key(key,self.prefix);data=payload.read_bytes() if isinstance(payload,Path) else payload
         # 单成品最多 512 MB；不用分段上传，避免未完成分段累积和额外 A 操作。
         if len(data)>512_000_000:raise SafetyStop('单成品过大，须重新评估')
@@ -216,10 +221,19 @@ class R2Store:
             if conditional:
                 if status==429 or code in ('429','SlowDown','Throttling','ThrottlingException','TooManyRequests','TooManyRequestsException'):
                     raise WriteThrottled(key) from error
-                if status==412 or code in ('PreconditionFailed','412','ConditionalRequestConflict','409'):
+                if status in (409,412) or code in ('PreconditionFailed','412','ConditionalRequestConflict','409'):
                     raise WriteConflict(key) from error
-            if code in ('PreconditionFailed','412'):
+                if transient_error(error):raise WriteUncertain(key) from error
+            if status==412 or code in ('PreconditionFailed','412'):
+                if immutable:
+                    self.requests['get']+=1
+                    existing=self.read_client.head_object(Bucket=self.bucket,Key=key)
+                    if existing.get('ContentLength')==len(data) and existing.get('ETag','').strip('"')==md5.hex():
+                        return md5.hex()
                 raise SafetyStop('对象已由其他任务写入，禁止覆盖') from error
+            raise
+        except (ConnectionError,HTTPClientError) as error:
+            if conditional:raise WriteUncertain(key) from error
             raise
         etag=response.get('ETag','').strip('"')
         if etag!=md5.hex():raise SafetyStop('上传返回的 ETag 与本地 MD5 不一致')
@@ -352,25 +366,32 @@ class Publisher:
     def put_json(self,key,value):
         return self.put(key,encoded(value))
 
-    def update_json(self,key,update):
-        throttled=0
-        for attempt in range(CONDITIONAL_WRITE_ATTEMPTS):
+    def update_json(self,key,update,*,guard_replay=False):
+        backed_off=0;uncertain_etag=UNCONDITIONAL;uncertain_error=None
+        for attempt in range(CONDITIONAL_WRITE_ATTEMPTS+1):
             current,etag=self.store.read_json_version(key)
             if current is not None and not etag:raise SafetyStop('控制清单缺少对象版本')
             value=update(current)
             if value==current:return current
+            if guard_replay and uncertain_etag is not UNCONDITIONAL and etag!=uncertain_etag:
+                raise SafetyStop('预算账本已更新，无法确认上一笔预留，停止以避免重复计入') from uncertain_error
+            if attempt==CONDITIONAL_WRITE_ATTEMPTS:
+                raise SafetyStop('R2 条件写入结果未确认，暂缓写入控制清单') from uncertain_error
             try:
                 self.put(key,encoded(value),expected=etag)
                 return value
-            except (WriteConflict,WriteThrottled) as error:
+            except (WriteConflict,WriteThrottled,WriteUncertain) as error:
+                if isinstance(error,WriteUncertain):
+                    uncertain_etag=etag;uncertain_error=error
                 if attempt+1==CONDITIONAL_WRITE_ATTEMPTS:
+                    if uncertain_error is not None:continue  # 最后只回读确认，不再发 PUT。
                     message='R2 持续限流，暂缓写入控制清单' if isinstance(error,WriteThrottled) else '控制清单并发写入未收敛'
                     raise SafetyStop(message) from error
-                if isinstance(error,WriteThrottled):
-                    delay=min(16,2**throttled)
-                    throttled+=1
-                else:
+                if isinstance(error,WriteConflict):
                     delay=min(2,.2*2**attempt)
+                else:
+                    delay=min(16,2**backed_off)
+                    backed_off+=1
                 time.sleep(delay+random.uniform(0,.2))
 
     def matches(self,key,size,md5):
@@ -417,10 +438,12 @@ class Publisher:
         if today.isoformat()!=day:raise SafetyStop('操作预算日期必须为YYYY-MM-DD')
         if type(writes) is not int or writes<0:raise SafetyStop('操作预留无效')
         key=PREFIX+'budgets/rolling-operations.json'
-        self.update_json(key,lambda ledger:self._operation_ledger(today,day,writes,ledger))
+        reservation=uuid4().hex
+        self.update_json(key,lambda ledger:self._operation_ledger(today,day,writes,reservation,ledger),guard_replay=True)
 
-    def _operation_ledger(self,today,day,writes,ledger):
+    def _operation_ledger(self,today,day,writes,reservation,ledger):
         cutoff=today-timedelta(days=BUDGET_WINDOW_DAYS-1)
+        recent=[]
         if ledger is None:
             # 旧月账本无法还原逐日用量，首次升级将相关月份的全部预留保守计入今天。
             legacy=0
@@ -435,10 +458,13 @@ class Publisher:
         else:
             if not isinstance(ledger,dict) or ledger.get('version')!=1 or ledger.get('window_days')!=BUDGET_WINDOW_DAYS or not isinstance(ledger.get('days'),dict) or len(ledger['days'])>BUDGET_WINDOW_DAYS:
                 raise SafetyStop('滚动操作预算记录异常')
+            recent=ledger.get('recent_reservations',[])
+            if not isinstance(recent,list) or len(recent)>RECENT_RESERVATIONS or any(
+                not isinstance(item,str) or not re.fullmatch('[a-f0-9]{32}',item) for item in recent):
+                raise SafetyStop('滚动操作预算预留记录异常')
             try:last_day=date.fromisoformat(ledger['as_of'])
             except (KeyError,TypeError,ValueError):raise SafetyStop('滚动操作预算日期异常')
             if last_day.isoformat()!=ledger['as_of']:raise SafetyStop('滚动操作预算日期异常')
-            if today<last_day:raise SafetyStop('操作预算日期倒退，禁止重置预算')
             days={};recorded_total=0
             for recorded,value in ledger['days'].items():
                 try:stamp=date.fromisoformat(recorded)
@@ -448,7 +474,10 @@ class Publisher:
                 recorded_total+=value
                 if stamp>=cutoff:days[recorded]=value
             if recorded_total>800_000:raise SafetyStop('滚动操作预算累计值异常')
+            if reservation in recent:return ledger
+            if today<last_day:raise SafetyStop('操作预算日期倒退，禁止重置预算')
         if sum(days.values())+writes>800_000:
             raise SafetyStop('上传操作保险丝：滚动35天预留A类操作将超过80万次')
         days[day]=days.get(day,0)+writes
-        return {'version':1,'window_days':BUDGET_WINDOW_DAYS,'as_of':day,'days':days}
+        return {'version':1,'window_days':BUDGET_WINDOW_DAYS,'as_of':day,'days':days,
+                'recent_reservations':(recent+[reservation])[-RECENT_RESERVATIONS:]}

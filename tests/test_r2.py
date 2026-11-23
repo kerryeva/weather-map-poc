@@ -4,7 +4,7 @@ from pathlib import Path
 from unittest.mock import Mock,patch
 from botocore.awsrequest import AWSResponse
 from botocore.stub import Stubber,ANY
-from botocore.exceptions import ClientError
+from botocore.exceptions import ClientError,ReadTimeoutError
 sys.path.insert(0,str(Path(__file__).resolve().parents[1]/'scripts'))
 from storage import Publisher,R2Store,SafetyStop,WriteConflict,PREFIX,CONDITIONAL_WRITE_ATTEMPTS
 
@@ -47,7 +47,18 @@ class R2Protocol(unittest.TestCase):
         with self.assertRaises(SafetyStop):self.store.put(PREFIX+'file',b'data')
     def test_object_collision_does_not_overwrite(self):
         self.stub.add_client_error('put_object',service_error_code='PreconditionFailed',http_status_code=412)
+        self.read_stub.add_response('head_object',{'ContentLength':4,'ETag':'"different"'},
+            {'Bucket':'test-bucket','Key':PREFIX+'file'})
         with self.assertRaises(SafetyStop):self.store.put(PREFIX+'file',b'data',immutable=True)
+
+    def test_immutable_412_recovers_a_previously_uploaded_identical_object(self):
+        key=PREFIX+'file';data=b'data';md5=hashlib.md5(data).hexdigest()
+        self.stub.add_client_error('put_object',service_error_code='PreconditionFailed',http_status_code=412)
+        self.read_stub.add_response('head_object',{'ContentLength':len(data),'ETag':f'"{md5}"'},
+            {'Bucket':'test-bucket','Key':key})
+        self.assertEqual(self.store.put(key,data,immutable=True),md5)
+        self.assertEqual(self.store.requests['put'],1)
+        self.assertEqual(self.store.requests['get'],1)
     def test_control_write_uses_conditional_create_and_replace(self):
         key=PREFIX+'available.json';data=b'{}'
         args={'Bucket':'test-bucket','Key':key,'Body':data,'ContentLength':len(data),
@@ -85,6 +96,25 @@ class R2Protocol(unittest.TestCase):
         self.assertEqual(send.call_count,CONDITIONAL_WRITE_ATTEMPTS)
         self.assertEqual(publisher.store.read_json_version.call_count,CONDITIONAL_WRITE_ATTEMPTS)
         self.assertEqual([call.args[0] for call in pause.call_args_list],[.2,1,2,1.6,4])
+
+    def test_conditional_write_recovers_5xx_and_timeouts_without_a_seventh_put(self):
+        key=PREFIX+'available.json'
+        publisher=Publisher.__new__(Publisher)
+        publisher.store=Mock()
+        publisher.put=self.store.put
+        publisher.store.read_json_version.return_value=({'published':False},'"before"')
+        timeout=ReadTimeoutError(endpoint_url='https://example.invalid')
+        error=ClientError({'ResponseMetadata':{'HTTPStatusCode':503},'Error':{'Code':'ServiceUnavailable'}},'PutObject')
+        with patch.object(self.store.conditional_client,'put_object',side_effect=[error,timeout]*3) as put,patch('storage.time.sleep'):
+            with self.assertRaisesRegex(SafetyStop,'写入结果未确认'):
+                publisher.update_json(key,lambda _:{'published':True})
+        self.assertEqual(put.call_count,CONDITIONAL_WRITE_ATTEMPTS)
+        self.assertEqual(publisher.store.read_json_version.call_count,CONDITIONAL_WRITE_ATTEMPTS+1)
+
+    def test_permanent_conditional_write_failure_is_not_retryable(self):
+        self.conditional_stub.add_client_error('put_object',service_error_code='AccessDenied',http_status_code=403)
+        with self.assertRaises(ClientError):
+            self.store.put(PREFIX+'available.json',b'{}',expected=None)
     def test_failed_delete_is_not_ignored(self):
         self.stub.add_response('delete_objects',{'Errors':[{'Key':PREFIX+'old','Code':'AccessDenied'}]})
         with self.assertRaises(SafetyStop):self.store.delete([PREFIX+'old'])
